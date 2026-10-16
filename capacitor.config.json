@@ -1,0 +1,6 @@
+{
+  "appId": "com.lahagame.tangleknit",
+  "appName": "Tangle Knit",
+  "webDir": "dist",
+  "android": { "backgroundColor": "#a9ddf8" }
+}
