@@ -1,22 +1,19 @@
-// The 10 onboarding levels. scripts/tune.ts picks each level's seed and `mix` so a
-// careless bot wins at the level's target rate and careful play always can.
-//
-// Building a level: the reference grid of holes, ropes between random pairs of holes
-// (mostly long, so they cross in a big tangle), a random stacking order (layers).
-// Then the order the ropes naturally come off in (a bot that only untangles) is cut
-// into threes: each three gets a colour, and those colours are the trays, in order.
-// `mix` swaps ropes between nearby threes — the more, the more balls wait in the
-// spare slots.
+// The 10 onboarding levels. Each is made offline by scripts/gen-levels.ts with the very
+// rules the game plays (board.ts on rope.ts physics): ropes laid out untangled, then
+// scrambled by carrying handles across each other (lifted, as the player does), and kept
+// only if loading the result and playing those moves back in reverse clears the board.
+// That reverse play is the hint line; the order the groups come off in gives the trays
+// (threes of a colour, `mix` swaps some). Written to levelData.ts.
 
-import { botRun, fromSpec, move, rngOf, solve, touch, type LevelSpec, type RopeSpec } from './sim.ts';
-import { layout, type ShapeName } from './shapes.ts';
-import { TUNED } from './tuned.ts';
+import type { LevelSpec } from './sim.ts';
+import type { BoardData } from './board.ts';
+import { LEVEL_DATA } from './levelData.ts';
+import { rngOf } from './sim.ts';
 
 export type Diff = 'easy' | 'normal' | 'hard' | 'super';
-export const LEVEL_COUNT = 10;
+export const LEVEL_COUNT = 100;
 /** Spare slots under the trays (the reference has four). */
 export const SPARE = 4;
-export interface Tune { seed: number; mix: number }
 
 export const YARN = [
   { name: 'Pink', color: '#F33180' },
@@ -45,124 +42,150 @@ export const TOY_INFO = [
   { name: 'Air Balloon', palette: [5, 3, 0, 2, 7, 6, 4, 1] },
   { name: 'Rubber Duck', palette: [7, 2, 5, 6, 3, 1, 4, 0] },
   { name: 'Toy Train', palette: [3, 0, 5, 4, 1, 6, 2, 7] },
+  { name: 'Snowman', palette: [0, 5, 7, 3, 6, 2, 4, 1] },
+  { name: 'Cactus Pot', palette: [2, 1, 6, 3, 5, 0, 7, 4] },
+  { name: 'Mushroom House', palette: [5, 1, 7, 4, 0, 6, 3, 2] },
+  { name: 'Whale', palette: [0, 1, 6, 3, 4, 2, 7, 5] },
+  { name: 'Penguin', palette: [7, 5, 4, 3, 2, 0, 6, 1] },
+  { name: 'Owl', palette: [7, 4, 1, 3, 2, 6, 5, 0] },
+  { name: 'Castle Tower', palette: [7, 6, 4, 1, 2, 3, 0, 5] },
+  { name: 'Teapot', palette: [3, 6, 4, 5, 2, 1, 0, 7] },
+  { name: 'Ice Cream', palette: [4, 2, 5, 1, 0, 7, 3, 6] },
+  { name: 'Hamburger', palette: [0, 6, 5, 2, 7, 3, 1, 4] },
+  { name: 'Double Decker', palette: [6, 2, 0, 4, 1, 3, 7, 5] },
+  { name: 'Airplane', palette: [7, 3, 4, 0, 6, 5, 1, 2] },
+  { name: 'Helicopter', palette: [5, 7, 6, 3, 1, 0, 2, 4] },
+  { name: 'Tractor', palette: [3, 2, 6, 0, 4, 7, 1, 5] },
+  { name: 'Ladybug', palette: [4, 1, 2, 5, 0, 7, 3, 6] },
+  { name: 'Octopus', palette: [4, 2, 5, 3, 6, 7, 1, 0] },
+  { name: 'Snail', palette: [1, 3, 2, 6, 7, 0, 4, 5] },
+  { name: 'Turtle', palette: [6, 7, 3, 5, 0, 4, 2, 1] },
+  { name: 'Frog', palette: [3, 0, 1, 4, 6, 7, 5, 2] },
+  { name: 'Kitty', palette: [0, 2, 7, 4, 5, 3, 6, 1] },
+  { name: 'Piggy', palette: [3, 5, 6, 4, 2, 0, 7, 1] },
+  { name: 'Lighthouse', palette: [3, 7, 5, 6, 2, 4, 1, 0] },
+  { name: 'Windmill', palette: [3, 1, 6, 7, 2, 0, 5, 4] },
+  { name: 'Camping Tent', palette: [1, 0, 7, 2, 5, 6, 4, 3] },
+  { name: 'Gift Box', palette: [2, 4, 0, 5, 7, 1, 6, 3] },
+  { name: 'Strawberry', palette: [4, 3, 1, 2, 6, 0, 7, 5] },
+  { name: 'Pineapple', palette: [0, 1, 6, 7, 2, 4, 5, 3] },
+  { name: 'Flower Pot', palette: [2, 4, 3, 7, 6, 1, 0, 5] },
+  { name: 'Dino', palette: [7, 2, 6, 0, 4, 3, 1, 5] },
+  { name: 'Unicorn', palette: [7, 4, 2, 3, 0, 5, 6, 1] },
+  { name: 'Panda', palette: [0, 4, 7, 3, 5, 1, 2, 6] },
+  { name: 'Fox', palette: [1, 2, 6, 0, 7, 5, 3, 4] },
+  { name: 'Elephant', palette: [4, 0, 3, 5, 2, 6, 1, 7] },
+  { name: 'Giraffe', palette: [2, 5, 7, 3, 0, 4, 6, 1] },
+  { name: 'Bumblebee', palette: [4, 0, 6, 7, 3, 2, 5, 1] },
+  { name: 'Fire Truck', palette: [3, 2, 4, 6, 5, 7, 0, 1] },
+  { name: 'Submarine', palette: [2, 5, 7, 1, 6, 0, 4, 3] },
+  { name: 'Treasure Chest', palette: [2, 6, 5, 7, 0, 1, 3, 4] },
+  { name: 'Carousel', palette: [4, 2, 5, 0, 1, 3, 6, 7] },
+  { name: 'Dragon', palette: [0, 7, 2, 4, 6, 5, 3, 1] },
 ];
 export const toyOf = (i: number): number => i % TOY_INFO.length;
 
+/** power: the ropes a Power Scissors may snip (the most tangled). */
+export interface Level { spec: LevelSpec; board: BoardData; solution: [number, number][]; power?: number[] }
 /** The level as the player sees it: colours mapped through the toy's palette. */
-export function levelFor(i: number): LevelSpec {
-  const spec = generate(i);
+export function levelFor(i: number): Level {
+  const d = LEVEL_DATA[i] ?? LEVEL_DATA[LEVEL_DATA.length - 1];
   const pal = TOY_INFO[toyOf(i)].palette;
-  for (const s of spec.ropes) s.c = pal[s.c];
-  spec.queue = spec.queue.map((c) => pal[c]);
-  return spec;
+  const board: BoardData = JSON.parse(JSON.stringify(d.board));
+  for (const r of board.ropes) r.color = pal[r.color];
+  for (const t of board.traps ?? []) for (const r of t.ropes) r.color = pal[r.color];
+  return {
+    spec: { ropes: [...board.ropes, ...(board.traps ?? []).flatMap((t) => t.ropes)].map((r, k) => ({ c: r.color, hidden: d.hidden.includes(k) })), queue: d.queue.map((c) => pal[c]), spare: SPARE },
+    board,
+    solution: d.solution.map((m) => [m[0], m[1]] as [number, number]),
+    power: d.power,
+  };
 }
 
 /**
  * Onboarding: one level at a time, each adding a little. L5 and L10 are the two
  * peaks ("Hard Level!"), L6 a breather that brings in the mystery rope.
  */
-interface Design { grid: ShapeName; ropes: number; colors: number; diff: Diff; hidden: number }
-const DESIGN: Design[] = [
-  { grid: 'grid:4x6', ropes: 6, colors: 2, diff: 'easy', hidden: 0 },     // 1  learn: drag a pin, rope comes off, a tray fills
-  { grid: 'grid:4x6', ropes: 9, colors: 3, diff: 'easy', hidden: 0 },     // 2  a third colour: the next tray slides in
-  { grid: 'grid:4x6', ropes: 9, colors: 3, diff: 'easy', hidden: 0 },     // 3  Undo
-  { grid: 'grid:4x6', ropes: 9, colors: 3, diff: 'normal', hidden: 0 },   // 4  spare slots start to matter
-  { grid: 'grid:4x7', ropes: 12, colors: 4, diff: 'hard', hidden: 0 },    // 5  first peak · Scissors
-  { grid: 'grid:4x6', ropes: 9, colors: 3, diff: 'easy', hidden: 0.25 },  // 6  breather · Mystery Rope
-  { grid: 'grid:4x7', ropes: 12, colors: 4, diff: 'normal', hidden: 0 },  // 7  +Slot
-  { grid: 'grid:4x7', ropes: 12, colors: 4, diff: 'normal', hidden: 0.2 },// 8
-  { grid: 'grid:5x6', ropes: 12, colors: 4, diff: 'normal', hidden: 0 },  // 9  a wider board
-  { grid: 'grid:5x7', ropes: 15, colors: 5, diff: 'hard', hidden: 0.2 },  // 10 second peak
-];
+/**
+ * cols × rows of the grid; ropes (a multiple of 3, for the trays); pairs: groups of two ropes
+ * sharing a handle; fixed / converted handles, forbidden slots and holes in the grid; and the
+ * other elements of spec §11 (counts); scramble: how many handle moves tangle it; mix: how far the
+ * tray colours stray from the untangling order. longMap: the level is two boards stacked, played
+ * through a window of the first one's height; trap: a trapdoor with a little level under it.
+ */
+export interface Design {
+  cols: number; rows: number; ropes: number; colors: number; diff: Diff; hidden: number; scramble: number; mix: number;
+  pairs: number; fixed: number; converted: number; forbidden: number; holes: number;
+  pillars: number; rail: number; umbrellas: number; toFixed: number; gears: number; multi: number; toggles: number; dynFixed: number;
+  longMap: boolean; trap: boolean;
+}
+/** Where each element is first met (1-based level) — the level shows its card and points at it. */
+export const ELEMENT_AT = { pair: 3, forbidden: 4, fixed: 6, hidden: 6, converted: 7, holes: 7, pillar: 12, rail: 16, umbrella: 21, toFixed: 26, gear: 31, multi: 36, toggle: 41, longMap: 46, trap: 51, dynFixed: 56 } as const;
+export type Element = keyof typeof ELEMENT_AT;
+
+/**
+ * The difficulty curve: a saw-tooth. In every ten levels: 1–4 climb, 5 is hard, 6 a breather,
+ * 7–9 climb again, 10 is super hard; each ten a notch harder than the last (more ropes, deeper
+ * scrambles, more elements mixed in). Elements come in one at a time (ELEMENT_AT), alone on their
+ * first level, then mix with the others.
+ */
+function design(i: number): Design {
+  const n = i + 1, block = Math.floor(i / 10), pos = i % 10;
+  const diff: Diff = pos === 9 ? 'super' : pos === 4 ? 'hard' : pos === 5 || n <= 3 ? 'easy' : 'normal';
+  const rng = rngOf(n * 7331 + 11);
+  // size: ropes by difficulty and block (6 … 15); the grid grows with them
+  const step = Math.min(3, block < 1 ? 0 : block < 3 ? 1 : block < 6 ? 2 : 3);
+  let ropes = diff === 'easy' ? 6 + 3 * Math.min(1, step) : diff === 'normal' ? 9 + 3 * Math.min(1, step) : diff === 'hard' ? 12 + 3 * Math.min(1, step >> 1) : 15;
+  if (n <= 2) ropes = n === 1 ? 6 : 9;
+  if (n === 5 || n === 10) ropes = n === 5 ? 12 : 15;
+  const colors = Math.min(5, ropes / 3);
+  let [cols, rows] = ropes <= 6 ? [4, 6] : ropes <= 9 ? [5, 7] : ropes <= 12 ? [6, 8] : [6, 9];
+  const scramble = Math.round(ropes * (diff === 'easy' ? 0.7 : diff === 'normal' ? 0.95 : diff === 'hard' ? 1.2 : 1.4) + block * 0.6);
+  const mix = diff === 'easy' ? 0.05 : diff === 'normal' ? 0.25 + block * 0.02 : diff === 'hard' ? 0.45 : 0.55;
+  void cols; void rows;
+  const d: Design = { cols, rows, ropes, colors, diff, hidden: 0, scramble, mix, pairs: 0, fixed: 0, converted: 0, forbidden: 0, holes: 0, pillars: 0, rail: 0, umbrellas: 0, toFixed: 0, gears: 0, multi: 0, toggles: 0, dynFixed: 0, longMap: false, trap: false };
+  // the elements met so far; a level that introduces one has it alone (and generously)
+  const met = (Object.keys(ELEMENT_AT) as Element[]).filter((e) => ELEMENT_AT[e] <= n);
+  const intro = met.filter((e) => ELEMENT_AT[e] === n);
+  const pick = intro.length ? intro : met.filter(() => rng() < (diff === 'easy' ? 0.2 : diff === 'normal' ? 0.3 : 0.42));
+  const many = diff === 'super' || diff === 'hard' ? 2 : 1;
+  for (const e of pick) {
+    if (e === 'pair') d.pairs = Math.min(Math.floor(ropes / 6), many);
+    else if (e === 'forbidden') d.forbidden = 1 + many;
+    else if (e === 'fixed') d.fixed = many;
+    else if (e === 'hidden') d.hidden = 0.2;
+    else if (e === 'converted') d.converted = many;
+    else if (e === 'holes') d.holes = 2;
+    else if (e === 'pillar') d.pillars = many;
+    else if (e === 'rail') d.rail = 1;
+    else if (e === 'umbrella') d.umbrellas = 1;
+    else if (e === 'toFixed') d.toFixed = 1;
+    else if (e === 'gear') d.gears = 1;
+    else if (e === 'multi') d.multi = many;
+    else if (e === 'toggle') d.toggles = 1;
+    else if (e === 'dynFixed') d.dynFixed = 1;
+  }
+  // long maps and trapdoors: their own levels (rare, never on a peak)
+  if (n === ELEMENT_AT.longMap || (n > ELEMENT_AT.longMap && (pos === 2 || pos === 7) && n % 20 === (pos === 2 ? 3 : 18) % 20)) { d.longMap = true; d.pairs = 0; }
+  if (n === ELEMENT_AT.trap || (n > ELEMENT_AT.trap && (pos === 3 || pos === 8) && block % 2 === (pos === 3 ? 1 : 0))) d.trap = true;
+  if (d.longMap && d.trap) d.trap = false;
+  // a trapdoor takes a 4 × 3 patch: one more row, at least five columns
+  if (d.trap) { d.rows = rows + 1; d.cols = Math.max(cols, 5); }
+  return d;
+}
+export const DESIGN: Design[] = Array.from({ length: LEVEL_COUNT }, (_, i) => design(i));
 export const diffOf = (i: number): Diff => DESIGN[i]?.diff ?? 'normal';
-export const shapeOf = (i: number): ShapeName => DESIGN[i]?.grid ?? 'grid:4x6';
-/** Win rates of the careless bot each level aims at — gentle, it is onboarding. */
-export const BAND: Record<Diff, [number, number]> = { easy: [0.85, 1], normal: [0.62, 0.88], hard: [0.4, 0.62], super: [0.25, 0.45] };
-export const AIM: Record<Diff, number> = { easy: 0.95, normal: 0.75, hard: 0.5, super: 0.35 };
 /** The level (1-based) each blocker first shows up. */
-export const BLOCKER_AT = { hidden: 6 } as const;
+export const BLOCKER_AT = { hidden: ELEMENT_AT.hidden, pair: ELEMENT_AT.pair, forbidden: ELEMENT_AT.forbidden, fixed: ELEMENT_AT.fixed, converted: ELEMENT_AT.converted, pillar: ELEMENT_AT.pillar, rail: ELEMENT_AT.rail, umbrella: ELEMENT_AT.umbrella, toFixed: ELEMENT_AT.toFixed, gear: ELEMENT_AT.gear, multi: ELEMENT_AT.multi, toggle: ELEMENT_AT.toggle, longMap: ELEMENT_AT.longMap, trap: ELEMENT_AT.trap, dynFixed: ELEMENT_AT.dynFixed } as const;
 export type Blocker = keyof typeof BLOCKER_AT;
 
 export interface Plan { diff: Diff; colors: number; ropes: number; hidden: number }
 export const planOf = (i: number): Plan => { const d = DESIGN[i] ?? DESIGN[DESIGN.length - 1]; return { diff: d.diff, colors: d.colors, ropes: d.ropes, hidden: d.hidden }; };
 
-function shuffle<T>(a: T[], rng: () => number): T[] {
+export function shuffle<T>(a: T[], rng: () => number): T[] {
   for (let i = a.length - 1; i > 0; i--) {
     const k = Math.floor(rng() * (i + 1));
     [a[i], a[k]] = [a[k], a[i]];
   }
   return a;
-}
-
-/** The order the ropes come off in when you only untangle (colours don't matter). */
-function naturalOrder(spec: LevelSpec, rng: () => number): number[] | null {
-  const plain: LevelSpec = { ...spec, ropes: spec.ropes.map((r) => ({ ...r, c: 0 })), queue: spec.queue.map(() => 0), spare: 99 };
-  const s0 = fromSpec(plain);
-  const run = botRun(s0, rng, 0.3, 0);
-  if (!run.win) return null;
-  const s = fromSpec(plain), order: number[] = [];
-  for (const [k, h] of run.path) for (const e of move(s, k, h)) if (e.k === 'pull') order.push(e.strand);
-  return order.length === spec.ropes.length ? order : null;
-}
-
-export function generate(i: number, tune: Tune = TUNED[i] ?? { seed: 1, mix: 0.2 }): LevelSpec {
-  const p = planOf(i);
-  const rng = rngOf(tune.seed * 7919 + i * 104729 + 31);
-  const holes = layout(shapeOf(i), 0);
-  const N = holes.length;
-  const dist = (x: number, y: number) => Math.hypot(holes[x][0] - holes[y][0], holes[x][1] - holes[y][1]);
-  let diam = 0;
-  for (let x = 0; x < N; x++) for (let y = x + 1; y < N; y++) diam = Math.max(diam, dist(x, y));
-  /** A new rope a–b must not run straight over a pin of the ropes laid so far, nor theirs over its pins. */
-  const nearLine = (q: number, a: number, b: number) => {
-    const [px, py] = holes[q], [ax, ay] = holes[a], [bx, by] = holes[b];
-    const dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy, t = ((px - ax) * dx + (py - ay) * dy) / L2;
-    return t > 0.02 && t < 0.98 && Math.abs(dx * (py - ay) - dy * (px - ax)) / Math.sqrt(L2) < 0.2;
-  };
-  const clear = (a: number, b: number, ropes: RopeSpec[]) => ropes.every((r) => !nearLine(r.a, a, b) && !nearLine(r.b, a, b) && !nearLine(a, r.a, r.b) && !nearLine(b, r.a, r.b));
-  for (let attempt = 0; attempt < 400; attempt++) {
-    // pins: pair up random holes, preferring long ropes across the board
-    const left = shuffle([...Array(N).keys()], rng).slice(0, p.ropes * 2);
-    const ropes: RopeSpec[] = [];
-    const layers = shuffle([...Array(p.ropes).keys()], rng);
-    let ok = true;
-    for (let r = 0; r < p.ropes && ok; r++) {
-      const a = left.shift()!;
-      let best = -1, bestV = -Infinity;
-      for (let q = 0; q < left.length; q++) {
-        const f = dist(a, left[q]) / diam;
-        const v = -Math.abs(f - (0.5 + rng() * 0.5)) + rng() * 0.3;
-        if (f > 0.22 && v > bestV && clear(a, left[q], ropes)) { bestV = v; best = q; }
-      }
-      if (best < 0) { ok = false; break; }
-      const b = left.splice(best, 1)[0];
-      ropes.push({ a, b, c: 0, layer: layers[r] });
-    }
-    if (!ok) continue;
-    // every rope starts tangled with something
-    if (ropes.some((x, k) => !ropes.some((y, m) => m !== k && touch(holes[x.a], holes[x.b], holes[y.a], holes[y.b])))) continue;
-    const triples = p.ropes / 3;
-    const spec: LevelSpec = { holes, shape: shapeOf(i), ropes, queue: new Array(triples).fill(0), spare: SPARE };
-    // colours: threes along the natural order, a fresh colour each (no two alike in a row)
-    const order = naturalOrder(spec, rng);
-    if (!order) continue;
-    for (let s = 0; s < order.length; s++) {
-      if (rng() >= tune.mix) continue;
-      const t = Math.min(order.length - 1, s + 3 + Math.floor(rng() * 4));
-      [order[s], order[t]] = [order[t], order[s]];
-    }
-    const cols = shuffle([...Array(p.colors).keys()], rng);
-    const queue: number[] = [];
-    for (let t = 0; t < triples; t++) {
-      let c = t < p.colors ? cols[t] : Math.floor(rng() * p.colors);
-      if (t >= p.colors && c === queue[t - 1]) c = (c + 1) % p.colors;
-      queue.push(c);
-    }
-    order.forEach((r, k) => { ropes[r].c = queue[Math.floor(k / 3)]; });
-    spec.queue = queue;
-    for (const r of ropes) if (rng() < p.hidden) r.hidden = true;
-    if (!solve(fromSpec(spec), 8)) continue;
-    return spec;
-  }
-  throw new Error(`level ${i + 1}: could not build`);
 }

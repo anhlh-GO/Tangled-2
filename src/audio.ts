@@ -86,6 +86,20 @@ function noise(dur: number, vol: number, freq: number, delay = 0): void {
 }
 
 export const sfx = {
+  /** Spec §13 sounds — a handle is picked up, passes over a slot, is put down, snaps back; a group comes off. */
+  pick(): void { tone(620, 0.06, 'sine', 0.09, 0, 1.4); },
+  tick(): void { tone(1500, 0.025, 'triangle', 0.035); },
+  place(): void { tone(330, 0.08, 'sine', 0.13, 0, 0.7); noise(0.04, 0.05, 1200); },
+  snap(): void { sweep(0.14, 0.05, 1400, 380); tone(240, 0.12, 'triangle', 0.07, 0.05); },
+  remove(): void { [784, 1047, 1319].forEach((f, i) => tone(f, 0.14, 'sine', 0.07, i * 0.04)); },
+  /** The hammer comes down. */
+  thump(): void { noise(0.12, 0.2, 700); tone(110, 0.2, 'sine', 0.2, 0, 0.5); },
+  /** An umbrella opens / closes, a trapdoor creaks open, the long map slides. */
+  whoosh(open: boolean): void { sweep(0.25, 0.05, open ? 500 : 1600, open ? 1600 : 500); },
+  creak(): void { tone(140, 0.35, 'sawtooth', 0.03, 0, 1.6); noise(0.3, 0.05, 900, 0.05); },
+  slide(): void { sweep(0.4, 0.04, 300, 900); },
+  /** A handle is nailed down (time-to-fixed, toggling). */
+  clank(): void { tone(1800, 0.05, 'square', 0.04); tone(900, 0.1, 'triangle', 0.06, 0.03); },
   /** A strand slides off its pegs: a soft zip. */
   pull(): void { noise(0.18, 0.08, 1800); tone(500, 0.18, 'sine', 0.1, 0, 1.8); },
   /** A ball drops in the basket. */

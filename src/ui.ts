@@ -86,29 +86,59 @@ export function adBadge(ctx: CanvasRenderingContext2D, x: number, y: number, s: 
   ctx.fill();
 }
 
-export type BoosterKey = 'undo' | 'scissors' | 'slot';
+export type BoosterKey = 'scissors' | 'hammer' | 'expand';
 
 export function boosterIcon(ctx: CanvasRenderingContext2D, key: BoosterKey, r: number): void {
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
-  if (key === 'undo') {
-    for (const [c, w] of [['#0b2563', 0.36], ['#ffffff', 0.2]] as const) {
-      ctx.strokeStyle = c;
-      ctx.lineWidth = r * w;
-      ctx.beginPath();
-      ctx.arc(r * 0.05, r * 0.1, r * 0.4, Math.PI * 1.05, Math.PI * 2.35);
-      ctx.stroke();
-    }
-    ctx.fillStyle = '#ffffff';
+  if (key === 'hammer') {
+    // a wooden handle, a steel head with a red cap
+    ctx.save();
+    ctx.rotate(-0.6);
     ctx.strokeStyle = '#0b2563';
     ctx.lineWidth = r * 0.08;
+    ctx.fillStyle = '#c98a4b';
     ctx.beginPath();
-    ctx.moveTo(-r * 0.66, -r * 0.02);
-    ctx.lineTo(-r * 0.3, -r * 0.52);
-    ctx.lineTo(-r * 0.06, r * 0.04);
-    ctx.closePath();
+    ctx.roundRect(-r * 0.08, -r * 0.2, r * 0.16, r * 0.85, r * 0.06);
     ctx.fill();
     ctx.stroke();
+    const steel = ctx.createLinearGradient(0, -r * 0.55, 0, -r * 0.2);
+    steel.addColorStop(0, '#f2f4f8');
+    steel.addColorStop(1, '#8d93a5');
+    ctx.fillStyle = steel;
+    ctx.beginPath();
+    ctx.roundRect(-r * 0.5, -r * 0.55, r * 0.75, r * 0.36, r * 0.08);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = '#ff4f5e';
+    ctx.beginPath();
+    ctx.roundRect(r * 0.2, -r * 0.6, r * 0.28, r * 0.46, r * 0.08);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  } else if (key === 'expand') {
+    // a 3×3 grid of slots with arrows pushing outwards
+    ctx.strokeStyle = '#0b2563';
+    ctx.lineWidth = r * 0.07;
+    for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
+      ctx.fillStyle = i === 0 && j === 0 ? '#ffffff' : '#dfe6f5';
+      ctx.beginPath();
+      ctx.arc(i * r * 0.26, j * r * 0.26, r * 0.1, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = r * 0.1;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const ax = dx * r * 0.5, ay = dy * r * 0.5, bx = dx * r * 0.72, by = dy * r * 0.72;
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(bx, by);
+      ctx.moveTo(bx - dy * r * 0.1 - dx * r * 0.1, by - dx * r * 0.1 - dy * r * 0.1);
+      ctx.lineTo(bx, by);
+      ctx.lineTo(bx + dy * r * 0.1 - dx * r * 0.1, by + dx * r * 0.1 - dy * r * 0.1);
+      ctx.stroke();
+    }
   } else if (key === 'scissors') {
     ctx.strokeStyle = '#0b2563';
     ctx.lineWidth = r * 0.1;
@@ -138,27 +168,6 @@ export function boosterIcon(ctx: CanvasRenderingContext2D, key: BoosterKey, r: n
       ctx.fill();
       ctx.fillStyle = '#ff4f6a';
     }
-  } else {
-    // a basket with a plus
-    ctx.fillStyle = '#d9a066';
-    ctx.strokeStyle = '#6b3f00';
-    ctx.lineWidth = r * 0.07;
-    ctx.beginPath();
-    ctx.moveTo(-r * 0.5, -r * 0.1);
-    ctx.lineTo(r * 0.5, -r * 0.1);
-    ctx.lineTo(r * 0.38, r * 0.42);
-    ctx.lineTo(-r * 0.38, r * 0.42);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    ctx.strokeStyle = 'rgba(107,63,0,0.6)';
-    for (const x of [-0.2, 0, 0.2]) { ctx.beginPath(); ctx.moveTo(x * r, -r * 0.1); ctx.lineTo(x * r * 0.8, r * 0.42); ctx.stroke(); }
-    ctx.fillStyle = '#ff7ac8';
-    ctx.beginPath(); ctx.arc(-r * 0.12, -r * 0.18, r * 0.18, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#3fd24a';
-    ctx.strokeStyle = '#0a4115';
-    ctx.beginPath(); ctx.arc(r * 0.42, -r * 0.4, r * 0.24, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-    outlinedText(ctx, '+', r * 0.42, -r * 0.4, r * 0.4, '#ffffff', '#0a4115');
   }
 }
 

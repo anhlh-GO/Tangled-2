@@ -6,11 +6,12 @@ import FalconSDK from '@falcongames/game-client-sdk';
 import { createFalconEvents, type FalconGame } from './falcon-game';
 import { FONT, outlinedText, roundRect, shade, sparkle } from './art';
 import { audio, haptic, setAudioPaused, sfx, unlockAudio } from './audio';
-import { BLOCKER_AT, LEVEL_COUNT, TOY_INFO, YARN, diffOf, levelFor, toyOf } from './levels';
-import { MAX_SPARE, addSlot, canMove, caught, clone, cut, emptyHoles, fromSpec, lockedOn, move, pinAt, relateRow, room, solve, stuck, tangled, won, type Ev, type State } from './sim';
+import { BLOCKER_AT, LEVEL_COUNT, TOY_INFO, YARN, diffOf, levelFor, toyOf, type Level } from './levels';
+import { MAX_SPARE, addSlot, cut, fromSpec, release as releaseRopes, room, won, type Ev, type LevelSpec, type State } from './sim';
+import { Board, type BoardEvent } from './board';
+import { Vector3 as THREE_V } from 'three';
+import { BOOSTER_UNLOCK, CFG } from './config';
 import { Scene3D } from './scene3d';
-import undoJpg from './assets/b_undo.jpg';
-import undoA from './assets/b_undo_a.png';
 import scissorsJpg from './assets/b_scissors.jpg';
 import scissorsA from './assets/b_scissors_a.png';
 import slotJpg from './assets/b_slot.jpg';
@@ -150,7 +151,7 @@ const INTRO_ART: Box = [150, 296, 1082, 655];
 const INTRO_TEXT: Box = [190, 700, 1035, 850];
 const INTRO_OK: Box = [300, 915, 925, 1090];
 void buildPopups();
-import { adBadge, bubble, button, card, inside, pointer, toast, type BoosterKey, type Rect } from './ui';
+import { adBadge, boosterIcon, bubble, button, card, inside, pointer, toast, type BoosterKey, type Rect } from './ui';
 
 export { LEVEL_COUNT };
 
@@ -169,33 +170,49 @@ const GREY = '#b9b3c4';
 
 // ---------------------------------------------------------------- save
 
-interface Save { b: Record<BoosterKey, number>; seen: Record<string, boolean>; wardrobe: number[] }
+/** enter: times each level was started (DynamicFixed, LevelFreeScissors); power: Power Scissors; wins: win streak. */
+interface Save { b: Record<BoosterKey, number>; seen: Record<string, boolean>; wardrobe: number[]; enter: Record<number, number>; power: number; wins: number }
 const SAVE_KEY = 'tanglerope_save';
-const save: Save = { b: { undo: 2, scissors: 2, slot: 1 }, seen: {}, wardrobe: [] };
+const save: Save = { b: { scissors: 2, hammer: 2, expand: 1 }, seen: {}, wardrobe: [], enter: {}, power: 0, wins: 0 };
 try {
   const s = JSON.parse(localStorage.getItem(SAVE_KEY) ?? 'null');
-  if (s) { Object.assign(save.b, s.b); Object.assign(save.seen, s.seen); if (Array.isArray(s.wardrobe)) save.wardrobe = s.wardrobe; }
+  if (s) { Object.assign(save.b, s.b); Object.assign(save.seen, s.seen); if (Array.isArray(s.wardrobe)) save.wardrobe = s.wardrobe; Object.assign(save.enter, s.enter ?? {}); save.power = s.power ?? 0; save.wins = s.wins ?? 0; }
 } catch { /* fresh */ }
 function persist(): void {
   try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch { /* ignore */ }
 }
 
-const BOOSTERS: BoosterKey[] = ['undo', 'scissors', 'slot'];
-const UNLOCK: Record<BoosterKey, number> = { undo: 3, scissors: 5, slot: 7 };
+const BOOSTERS: BoosterKey[] = ['scissors', 'hammer', 'expand'];
+const UNLOCK: Record<BoosterKey, number> = { ...BOOSTER_UNLOCK };
 const B_DESC: Record<BoosterKey, string> = {
-  undo: 'Take back your last move.',
   scissors: 'Snip any rope — even one tangled in the middle!',
-  slot: 'One more spare slot under the trays.',
+  hammer: 'Smash a nailed pin loose, or open a crossed-out slot.',
+  expand: 'Adds a ring of empty slots all round the board.',
 };
 const INTRO = {
-  hidden: { title: 'Mystery Rope', text: 'A grey rope shows its color once it is tangled with one rope or less.' },
+  pair: { title: 'Double Pin', text: 'Some pins hold two ropes. Untangle both to clear them!' },
+  forbidden: { title: 'Blocked Slot', text: 'Crossed-out slots can\u2019t take a pin. The Hammer opens them.' },
+  hidden: { title: 'Mystery Rope', text: 'A grey rope shows its color once it touches one rope or less.' },
+  fixed: { title: 'Nailed Pin', text: 'A nailed pin can\u2019t be moved. Untangle around it — or Hammer it loose!' },
+  converted: { title: 'Counting Pin', text: 'This pin moves only a few more times — its ring color shows how many.' },
+  pillar: { title: 'Post', text: 'Ropes can\u2019t pass through a post — lead them round it.' },
+  rail: { title: 'Slide Rail', text: 'A pin on a rail only slides along it, and nothing else can stand there.' },
+  umbrella: { title: 'Umbrella', text: 'While the umbrella is open, the slots under it are off limits. Wait for it to close!' },
+  toFixed: { title: 'Timer Pin', text: 'When its ring runs out, this pin is nailed down. Move it in time!' },
+  gear: { title: 'Gear Pins', text: 'Pins with the same gear move together, by the same step.' },
+  multi: { title: 'Big Pin', text: 'A big pin covers several slots — every one of them must be free where it goes.' },
+  toggle: { title: 'Blinking Nail', text: 'This pin is nailed and free in turn. Catch it while it\u2019s free!' },
+  longMap: { title: 'Long Board', text: 'The board goes on below! Clear the top row and the view slides down.' },
+  trap: { title: 'Trapdoor', text: 'Clear everything off the trapdoor and it opens — with more ropes inside!' },
+  dynFixed: { title: 'Stubborn Nail', text: 'A nail that gives up if you get stuck here a couple of times.' },
 };
 
 // ---------------------------------------------------------------- state
 
 interface Leave { t: number; x0: number; y0: number; m: number; u: number; mx: number; my: number; lead: boolean; group: Ball[] }
 /** A ball of yarn: in tray 0/1 (slot 0..2), or tray -1 = spare slot `slot`. */
-interface Ball { c: number; x: number; y: number; x0: number; y0: number; t: number; dur: number; tray: number; slot: number; leaving?: Leave; part?: number }
+/** holdUntil: its tray is being changed — it hovers over it until the new one is in. landAt: when it dropped in (a little bounce). */
+interface Ball { c: number; x: number; y: number; x0: number; y0: number; t: number; dur: number; tray: number; slot: number; leaving?: Leave; part?: number; holdUntil?: number; landAt?: number }
 /** What a tray looks like now: its colour, and (while the full one is being knitted) the old colour until `swapAt`, then it slides in. */
 interface TrayView { c: number; old: number; swapAt: number }
 interface Particle { x: number; y: number; vx: number; vy: number; life: number; max: number; color: string; size: number }
@@ -204,7 +221,16 @@ type PopupKind = 'win' | 'full' | 'stuck' | 'settings' | 'intro';
 interface Popup { kind: PopupKind; t: number; booster?: BoosterKey; blocker?: keyof typeof INTRO }
 
 let level = 0;
-let S: State = fromSpec(levelFor(0));
+let lv: Level = levelFor(0);
+let spec: LevelSpec = lv.spec;
+let S: State = fromSpec(spec);
+/** The board: slots, handles, ropes — the Tangled Rope rules (board.ts). */
+let board = new Board(lv.board);
+/** Spec §14: what a level saw — moves, boosters, play time, and a trace of what happened. */
+let stats = { moves: 0, boosters: { scissors: 0, hammer: 0, expand: 0, power: 0 } as Record<string, number>, time: 0, trace: [] as { t: number; e: string; d?: unknown }[] };
+function trace(e: string, d?: unknown): void { if (stats.trace.length < 600) stats.trace.push({ t: +board.time.toFixed(2), e, d }); }
+/** Power Scissors (spec §10.1): from this level a level can open with one rope snipped for free. */
+const POWER_AT = 24;
 /** The toy's colour plan: each part's yarn, and for colour c the knit steps of its triples (part, fill-to). */
 let plan: { color: number[]; steps: Map<number, { part: number; to: number }[][]> } = { color: [], steps: new Map() };
 let knitLog: number[] = [];   // colour of every triple knitted so far
@@ -212,7 +238,6 @@ let revealed: boolean[] = [];
 let balls: Ball[] = [];          // every ball sitting in (or flying to) a tray or a spare slot
 let leavingBalls: Ball[] = [];
 let trayView: TrayView[] = [];
-let history: { s: State; revealed: boolean[] }[] = [];
 let ended = false;
 let paused = false;
 let busy = 0;
@@ -300,7 +325,8 @@ function layout(): Layout {
 function placeBasket(): void {
   const t = scene.boardTop;
   if (!t || !(t.x1 - t.x0 >= 10) || !isFinite(t.y)) return;
-  const tw = t.x1 - t.x0, w = Math.min(Math.max(tw * 1.08, L.colW * 0.8), L.colW * 0.92), h = w * TRAY_AR, cx = (t.x0 + t.x1) / 2;
+  // the tray area: a little narrower than the board (TRAY_SCALE), centred over it
+  const tw = t.x1 - t.x0, w = Math.min(Math.max(tw * 1.08, L.colW * 0.8), L.colW * 0.92) * TRAY_SCALE, h = w * TRAY_AR, cx = (t.x0 + t.x1) / 2;
   L.basket = { x: cx - w / 2, y: t.y - tw * 0.04 - h, w, h };
   L.toy.h = Math.max(L.H * 0.12, L.basket.y - L.H * 0.01 - L.toy.y);
 }
@@ -314,6 +340,7 @@ function boosterAt(i: number): { x: number; y: number } {
  * and under them the row of round spare slots.
  */
 const TRAY_AR = 0.4;          // area height / width
+const TRAY_SCALE = 0.85;      // the whole tray area, smaller than it was (asked 18/10/2026)
 const TRAY_H = 0.2;           // a tray's height (of the area width)
 function trayRect(t: number): Rect {
   const b = L.basket, w = b.w * 0.47;
@@ -329,14 +356,31 @@ function spareXY(k: number): { x: number; y: number; r: number } {
   const b = L.basket, n = Math.max(S.cap, k + 1), gap = b.w * 0.155;
   return { x: b.x + b.w / 2 + (k - (n - 1) / 2) * gap, y: b.y + b.w * (TRAY_H + 0.115), r: b.w * 0.062 };
 }
-const ballXY = (b: Ball) => (b.tray >= 0 ? trayHole(b.tray, b.slot) : spareXY(b.slot));
+const ballXY = (b: Ball) => {
+  if (b.tray >= 0 && b.holdUntil !== undefined && clock < b.holdUntil) {
+    // its tray is being swapped: wait just above where its hole will be, bobbing
+    const r = trayRect(b.tray), h = { x: r.x + r.w * (0.22 + b.slot * 0.28), y: r.y + r.h * 0.52, r: r.h * 0.29 };
+    return { x: h.x, y: h.y - h.r * 2.6 + Math.sin(clock * 6 + b.slot) * h.r * 0.15, r: h.r };
+  }
+  return b.tray >= 0 ? trayHole(b.tray, b.slot) : spareXY(b.slot);
+};
 /** 0 = in place, 1 = fully off to the side (a new tray coming in). */
+const TRAY_OUT = 0.26, TRAY_IN = 0.36;
+/**
+ * How far tray t is slid off to its side (0 = in place, 1 = gone): the full one slides out
+ * (speeding up) just before `swapAt`, the next one slides in after it (slowing, a little overshoot).
+ */
 function traySlide(t: number): number {
   const v = trayView[t];
-  if (!v || clock < v.swapAt) return 0;
-  const k = Math.min(1, (clock - v.swapAt) / 0.32);
-  return k >= 1 ? 0 : (1 - k) * (1 - k);
+  if (!v || v.swapAt < 0) return 0;
+  if (clock < v.swapAt) { const k = (clock - (v.swapAt - TRAY_OUT)) / TRAY_OUT; return k <= 0 ? 0 : k * k; }
+  const k = Math.min(1, (clock - v.swapAt) / TRAY_IN);
+  if (k >= 1) return 0;
+  const c1 = 1.4, back = 1 + (c1 + 1) * (k - 1) ** 3 + c1 * (k - 1) ** 2;   // ease out with overshoot
+  return 1 - back;
 }
+/** When tray t is back in place after a change (now or later). */
+const trayReady = (t: number): number => (trayView[t] && trayView[t].swapAt >= 0 ? trayView[t].swapAt + TRAY_IN : 0);
 /** Rebuild the trays and spare balls from the rules (level start, undo). */
 function syncTrays(): void {
   trayView = S.trays.map((t) => ({ c: t.c, old: t.c, swapAt: -1 }));
@@ -351,19 +395,16 @@ let lastPullAt = { x: 0, y: 0 };
 
 function colorOf(i: number): string { return revealed[i] ? YARN[S.ropes[i].c].color : GREY; }
 
+/** Lay the board out. */
 function buildBoard(): void {
-  scene.build(S.holes, S.end, S.ropes, S.ropes.map((_, i) => colorOf(i)), S.lock, S.ropes.map((t, i) => !!t.hidden && !revealed[i]), S.gone, S.rel);
-  // the carried rope lies as the rules would have it, live: over what it is free of, under / hooked round what holds it
-  scene.setDragRule((k, p) => relateRow(S, k >> 1, k & 1, p));
-  S.gone.forEach((g, i) => { if (g) scene.setGone(i, true); });
-  if (S.lock >= 0) scene.setUnlocked(S.unlocked, true);
+  scene.build(board, S.ropes.map((_, i) => colorOf(i)), S.ropes.map((t, i) => !!t.hidden && !revealed[i]));
 }
 
 /** Grey ropes show their colour once they cross at most one other rope. */
 function revealFree(): void {
   let any = false;
   S.ropes.forEach((s, i) => {
-    if (!revealed[i] && !S.gone[i] && tangled(S, i).length <= 1) {
+    if (!revealed[i] && !S.gone[i] && board.touchCount(i) <= 1) {
       any = true;
       revealed[i] = true;
       scene.setColor(i, YARN[s.c].color);
@@ -380,7 +421,14 @@ function startLevel(index: number): void {
   level = clamp(Math.floor(index), 0, LEVEL_COUNT - 1);
   runId++;
   timers.length = 0;
-  S = fromSpec(levelFor(level));
+  lv = levelFor(level);
+  spec = lv.spec;
+  S = fromSpec(spec);
+  save.enter[level] = (save.enter[level] ?? 0) + 1;
+  persist();
+  board = new Board(lv.board, save.enter[level]);
+  stats = { moves: 0, boosters: { scissors: 0, hammer: 0, expand: 0, power: 0 }, time: 0, trace: [] };
+  trace('LevelStart', { level: level + 1, enter: save.enter[level] });
   revealed = S.ropes.map((s) => !s.hidden);
   scene.setToy(toyOf(level));
   plan = planToy();
@@ -390,15 +438,12 @@ function startLevel(index: number): void {
   lastBlink = -1;
   cutFx = null;
   drillFx = null;
-  history = [];
   ended = false;
   paused = false;
   busy = 0;
   popup = null;
   armed = null;
   hint = { pin: -1, hole: -1, t: 0 };
-  selected = -1;
-  scene.select(-1);
   particles = [];
   floaters = [];
   streak = 0;
@@ -410,6 +455,21 @@ function startLevel(index: number): void {
   const d = diffOf(level);
   banner = d === 'hard' ? { text: 'Hard Level!', sub: 'Mind the spare slots', t: 1.8 } : d === 'super' ? { text: 'Super Hard!', sub: 'Mind the spare slots', t: 1.8 } : { text: '', sub: '', t: 0 };
   setupTutorial();
+  // Power Scissors: a level can open with its most tangled rope snipped, free
+  if (level + 1 >= POWER_AT && save.power > 0 && lv.power?.length) {
+    const run = runId;
+    void wait(1.2).then(() => {
+      if (run !== runId || ended) return;
+      const target = lv.power![Math.floor(Math.random() * lv.power!.length)];
+      if (S.gone[target]) return;
+      const r = board.world.ropes[board.ropes[target].w];
+      save.power--; persist();
+      stats.boosters.power++;
+      showToast('Power Scissors!');
+      freeSnip = true;
+      snip(target, Math.floor(r.n / 2));
+    });
+  }
   events.emit('levelStart', { index: level, difficulty: d, levelId: `L${level + 1}` });
 }
 
@@ -432,9 +492,8 @@ function play(evs: Ev[]): void {
   /** When each tray shows its new colour (a full tray first merges and knits). */
   const swapAt = [0, 0];
   for (const e of evs) {
-    if (e.k === 'move') continue;
     if (e.k === 'pull') {
-      scene.setGone(e.strand, true);
+      scene.setGone(e.strand);
       sfx.pull();
       haptic(10);
       const p = scene.toScreen(scene.midOf(e.strand));
@@ -447,7 +506,11 @@ function play(evs: Ev[]): void {
       delay = Math.max(delay, 0.5 + COIL);
       void wait(last.dur + COIL).then(() => { if (run === runId) { busy--; sfx.ball(); } });
     } else if (e.k === 'ball') {
-      if (last) { last.tray = e.tray; last.slot = e.slot; }
+      if (last) {
+        last.tray = e.tray; last.slot = e.slot;
+        // its tray is still being changed: it waits over it, then drops in
+        if (e.tray >= 0 && trayReady(e.tray) > clock + 0.05) last.holdUntil = trayReady(e.tray) + 0.04 + e.slot * 0.08;
+      }
     } else if (e.k === 'fromSpare') {
       // a waiting ball hops from its spare slot into the tray that just came in; the rest close up
       const b = balls.find((o) => o.tray === -1 && o.slot === e.from);
@@ -455,21 +518,23 @@ function play(evs: Ev[]): void {
       if (b) {
         b.tray = e.tray; b.slot = e.slot;
         b.x0 = b.x; b.y0 = b.y;
-        const at = Math.max(delay, swapAt[e.tray] - clock) + 0.3 + e.slot * 0.08;
-        b.t = -at / 0.4; b.dur = 0.4;
+        // only once the new tray is fully in: one after another
+        const at = Math.max(delay, trayReady(e.tray) - clock) + 0.06 + e.slot * 0.12;
+        b.t = -at / 0.42; b.dur = 0.42;
+        b.landAt = undefined;
         busy++;
-        void wait(at + 0.4).then(() => { if (run === runId) { busy--; sfx.ball(); } });
+        void wait(at + 0.42).then(() => { if (run === runId) { busy--; sfx.ball(); } });
       }
     } else if (e.k === 'knit') {
       // the tray's three land, merge into one ("match 3"), then knit into the toy
       const c = e.c, t = e.tray;
       const group = balls.filter((b) => b.tray === t).sort((a2, b2) => a2.slot - b2.slot).slice(0, 3);
       // wait for the last of the three to land
-      const land = Math.max(delay, ...group.map((b) => (b.t < 0 ? -b.t * b.dur + b.dur : b.t < 1 ? (1 - b.t) * b.dur : 0)));
+      const land = Math.max(delay, ...group.map((b) => Math.max(b.t < 0 ? -b.t * b.dur + b.dur : b.t < 1 ? (1 - b.t) * b.dur : 0, b.holdUntil !== undefined ? b.holdUntil - clock + 0.18 : 0)));
       group.forEach((b, i) => { b.leaving = { t: -land, x0: 0, y0: 0, m: 0, u: 0, mx: 0, my: 0, lead: i === 1, group }; });
       leavingBalls.push(...group);
       balls = balls.filter((b) => !b.leaving);
-      swapAt[t] = clock + land + MERGE + 0.15;
+      swapAt[t] = clock + land + MERGE + TRAY_OUT;
       void wait(land).then(() => { if (run === runId) { sfx.match(); haptic(15); } });
       void wait(land + MERGE).then(() => {
         if (run !== runId) return;
@@ -488,16 +553,8 @@ function play(evs: Ev[]): void {
       // the next tray of the queue slides in once the full one has gone
       const v = trayView[e.tray];
       trayView[e.tray] = { c: e.c, old: v ? (clock < v.swapAt ? v.old : v.c) : e.c, swapAt: swapAt[e.tray] || clock };
+      void wait(Math.max(0, (swapAt[e.tray] || clock) - clock - TRAY_OUT)).then(() => { if (run === runId) sfx.whoosh(false); });
       void wait(Math.max(0, (swapAt[e.tray] || clock) - clock)).then(() => { if (run === runId && e.c >= 0) sfx.toggle(true); });
-    } else if (e.k === 'unlock') {
-      scene.setUnlocked(true);
-      sfx.unlock();
-      void wait(0.55).then(() => {
-        if (run !== runId) return;
-        haptic(25);
-        const at = scene.lockPoint();
-        if (at) { const q = scene.toScreen(at); burst(q.x, q.y, '#ffd34a', 16, 1); floaters.push({ text: 'Unlocked!', x: q.x, y: q.y - L.u * 0.06, t: 0, color: '#fff36b', size: L.u * 0.045 }); }
-      });
     } else if (e.k === 'full') {
       void wait(delay + 0.3).then(() => {
         if (run !== runId) return;
@@ -508,7 +565,6 @@ function play(evs: Ev[]): void {
       });
     }
   }
-  if (evs.some((e) => e.k === 'pull')) scene.setEnds(S.end, [], S.rel);
   revealFree();
   hint = { pin: -1, hole: -1, t: 0 };
   void wait(0.6).then(() => { if (run === runId) checkEnd(run); });
@@ -649,58 +705,82 @@ function checkEnd(run: number): void {
       void wait(SHOW).then(() => {
         if (run !== runId) return;
         popup = { kind: 'win', t: 0 };
+        // a win streak of three earns a Power Scissors (from level POWER_AT)
+        save.wins++;
+        if (save.wins % 3 === 0 && level + 1 >= POWER_AT - 1) { save.power++; showToast('Win streak! +1 Power Scissors'); }
+        persist();
+        trace('LevelEnd', { result: 'win', ...stats, trace: undefined });
         events.emit('win');
       });
     });
-  } else if (stuck(S)) {
-    ended = true;
-    popup = { kind: 'stuck', t: 0 };
-    sfx.lose();
-    haptic(60);
   }
 }
 
-/** Why pin k can't be picked up (one reason), or null if it can. */
-function pinBlocked(k: number): string | null {
-  if (S.lost || S.gone[k >> 1]) return 'gone';
-  if (!S.unlocked && S.end[k] === S.lock) return 'lock';
-  return null;
-}
-function nope(k: number): void {
+/** A handle that can't be picked: it bounces, and says why (once in a while). */
+function nope(k: number, why = ''): void {
   scene.bumpPin(k);
-  scene.shake(k >> 1);
   sfx.nope();
   haptic(35);
-  if (pinBlocked(k) === 'lock') {
-    scene.shakeLock();
-    sfx.rattle();
-    const key = S.ropes.findIndex((t, j) => t.key && !S.gone[j]);
-    if (key >= 0) scene.glow(key);
-    showToast('Locked! Untangle the rope with the key');
-  }
+  if (why === 'fixed') showToast(level + 1 >= UNLOCK.hammer ? 'Nailed down! Use the Hammer to free it' : 'This pin is nailed down');
 }
 
-/** Move pin k into hole h: the rules move it at once, the view lets it glide in, then ropes that came free reel off. */
-async function movePin(k: number, h: number, dur = 0.13): Promise<void> {
-  if (!canMove(S, k, h) || !coachAllows(`m${k}:${h}`)) {
-    if (scene.dragging === k) await scene.endDrag(S.end[k], S.end, 0.16, S.rel);
-    return;
-  }
-  history.push({ s: clone(S), revealed: revealed.slice() });
-  if (history.length > 30) history.shift();
+/** The finger on the board plane (board units), as the rules take it. */
+function fingerAt(x: number, y: number): [number, number] | null {
+  const q = scene.boardPoint(x, y, 0);
+  return q ? [q.x, q.z] : null;
+}
+
+/** What the rules report each frame: sounds, the trays, the tutorial. */
+let lastRemove = -1;
+function onBoard(evs: BoardEvent[]): void {
   const run = runId;
-  const evs = move(S, k, h);
-  if (scene.dragging !== k) scene.beginDrag(k);
-  busy++;
-  sfx.tap();
-  await scene.endDrag(h, S.end, dur, S.rel);
-  busy--;
-  if (run !== runId) return;
-  haptic(8);
-  scene.setEnds(S.end, [], S.rel);
-  coachEvent('move');
-  play(evs);
-  if (evs.some((e) => e.k === 'pull')) coachEvent('pull');
+  for (const e of evs) {
+    if (e.k === 'pick') { sfx.pick(); haptic(6); hint = { pin: -1, hole: -1, t: 0 }; stats.moves = board.moves; trace('PickTriggered', e.h); }
+    else if (e.k === 'pickFail') { trace('PickBlocked', { h: e.h, why: e.why }); pickFailed(e.h, e.why); }
+    else if (e.k === 'enterSlot') { haptic(4); sfx.tick(); }
+    else if (e.k === 'place') { haptic(12); scene.bumpPin(e.h); sfx.place(); coachEvent('move'); trace('Place', e); }
+    else if (e.k === 'snap') {
+      haptic(25);
+      sfx.snap();
+      scene.bumpPin(e.h);
+      trace('Snap', e);
+      if (e.why === 'stress' || e.why === 'stretched') showToast('Too tight! The rope snapped the pin back');
+    }
+    else if (e.k === 'stress') scene.flash(e.rope);
+    else if (e.k === 'disappear') {
+      // the group comes off: its ropes roll into balls for the trays
+      if (clock - lastRemove >= 0.1) { sfx.remove(); lastRemove = clock; }
+      haptic(15);
+      trace('GroupDisappear', e.ropes);
+      const evs2 = releaseRopes(S, e.ropes);
+      if (evs2.length) { play(evs2); coachEvent('pull'); }
+    }
+    else if (e.k === 'hammer') {
+      scene.shake();
+      sfx.thump();
+      haptic([20, 30, 40]);
+      const p = scene.toScreen(new THREE_V(e.at[0], 0.3, e.at[1]));
+      burst(p.x, p.y, '#ffd34a', 14, 1);
+      const text = e.what === 'handle' ? 'Free!' : e.what === 'slot' ? 'Open!' : 'Smash!';
+      floaters.push({ text, x: p.x, y: p.y - L.u * 0.05, t: 0, color: '#fff36b', size: L.u * 0.045 });
+    }
+    else if (e.k === 'nowFixed') { sfx.clank(); scene.bumpPin(e.h); haptic(15); }
+    else if (e.k === 'toggle') { sfx.clank(); scene.bumpPin(e.h); }
+    else if (e.k === 'umbrella') sfx.whoosh(e.open);
+    else if (e.k === 'window') { sfx.slide(); trace('Window', e.min); }
+    else if (e.k === 'trapOpening') sfx.creak();
+    else if (e.k === 'trapOpen') { sfx.booster(); trace('TrapOpen', e.trap); }
+    else if (e.k === 'cleared') void wait(CFG.delayInvokeGameFinishEventTime).then(() => { if (run === runId) checkEnd(run); });
+  }
+}
+/** Why a handle didn't come up, said once in a while (spec §4.1 PickBlockReason). */
+function pickFailed(k: number, why: string): void {
+  nope(k, why);
+  const say: Record<string, string> = {
+    umbrella: 'Wait for the umbrella to close!', toggled: 'Nailed right now — wait a moment!', gear: 'Its gear partner can\u2019t move',
+    noRoom: 'No room — the ropes pull it every way', window: 'Clear the rows above first',
+  };
+  if (say[why]) showToast(say[why]);
 }
 
 // ---------------------------------------------------------------- boosters
@@ -709,8 +789,17 @@ function boosterLocked(k: BoosterKey): number { return level + 1 < UNLOCK[k] ? U
 
 async function useBooster(k: BoosterKey, gift = false): Promise<void> {
   if ((ended && !gift) || busy || boosterLocked(k)) return;
-  if (armed === k) { armed = null; return; }
+  // tapping the armed booster again: put it away (Expansion: that confirms the preview ring)
+  if (armed === k) {
+    if (k === 'expand') { board.confirmExpansion(); spend('expand'); sfx.booster(); floaters.push({ text: 'More room!', x: L.colX + L.colW / 2, y: L.H * 0.6, t: 0, color: '#fff36b', size: L.u * 0.05 }); }
+    armed = null; board.tool = 'normal';
+    return;
+  }
+  if (armed === 'expand') board.cancelExpansion();
+  armed = null; board.tool = 'normal';
   if (!gift && save.b[k] <= 0) {
+    // LevelFreeScissors (spec §10): stuck on this level (3+ tries) and out of scissors — one free (an ad, if ads are on)
+    if (k === 'scissors' && (save.enter[level] ?? 0) >= 3) showToast('Stuck here? Free Scissors!');
     const ads = ADS();
     if (ads?.enabled) {
       paused = true;
@@ -726,27 +815,13 @@ async function useBooster(k: BoosterKey, gift = false): Promise<void> {
     sfx.booster();
     return;
   }
-  if (k === 'scissors') { armed = 'scissors'; freeSnip = gift; sfx.arm(); haptic(10); return; }
-  if (k === 'undo') {
-    const h = history.pop();
-    if (!h) { showToast('Nothing to undo yet!'); return; }
-    selected = -1;
-    scene.select(-1);
-    const cap = S.cap;
-    S = h.s;
-    S.cap = Math.max(S.cap, cap);
-    revealed = h.revealed;
-    const redo = knitLog.slice(0, S.knitted);
-    knitLog = [];
-    scene.resetToy();
-    for (const c of redo) knitToy(c, true);
-    syncTrays();
-    buildBoard();
-  } else {
-    if (S.cap >= MAX_CAP) { showToast('No room for another spare slot!'); return; }
-    openSlot();
-  }
-  spend(k);
+  if (k === 'scissors') { armed = 'scissors'; board.tool = 'scissors'; freeSnip = gift; sfx.arm(); haptic(10); showToast('Tap a rope to snip it'); return; }
+  if (k === 'hammer') { armed = 'hammer'; board.tool = 'hammer'; sfx.arm(); haptic(10); showToast('Tap a nailed pin or a crossed-out slot'); return; }
+  // Expansion: show the ring first, tap again to keep it (anywhere else: cancel, nothing spent)
+  if (!board.previewExpansion().length) { showToast('No room to grow the board'); return; }
+  armed = 'expand';
+  sfx.arm();
+  showToast('Tap Expand again to add these slots');
 }
 let freeSnip = false;
 let clearArm = 0;     // Settings > Clear Data waits for a second tap while > 0
@@ -755,23 +830,26 @@ let lastPopup: Popup | null = null;
 let lastRoom = 9;
 
 function spend(k: BoosterKey): void {
+  stats.boosters[k] = (stats.boosters[k] ?? 0) + 1;
+  trace('ToolUse', k);
   save.b[k]--;
   persist();
-  if (k === 'undo') sfx.undo();   // scissors snip and +Slot drill play their own sounds
   haptic(20);
   try { (FalconSDK as unknown as { analytics?: { turn?: { useBooster?(k: string): void } } }).analytics?.turn?.useBooster?.(k); } catch { /* optional */ }
 }
 
-function snip(i: number): void {
+/** Scissors: cut rope `i` at bead `q` — the scissors fly there, snip twice, and the rope parts (board.ts). */
+function snip(i: number, q: number): void {
+  if (!board.cut(i, q, CUT_FLY + CUT_SNIP * 0.62)) { showToast('Too close to the pin — snip nearer the middle'); sfx.nope(); return; }
   coachEvent('snip');
-  history.push({ s: clone(S), revealed: revealed.slice() });
   armed = null;
+  board.tool = 'normal';
   if (!freeSnip) spend('scissors');
   freeSnip = false;
   ended = false;
-  // the scissors fly from their button to the strand, snip twice, then the strand comes off
-  const p = scene.toScreen(scene.midOf(i));
-  const from = boosterAt(1);
+  const r = board.world.ropes[board.ropes[i].w];
+  const p = scene.toScreen(new THREE_V(r.x[q * 3], r.x[q * 3 + 1], r.x[q * 3 + 2]));
+  const from = boosterAt(BOOSTERS.indexOf('scissors'));
   cutFx = { i, x: p.x, y: p.y, x0: from.x, y0: from.y, t: 0, clacks: 0, cut: false };
   busy++;
 }
@@ -886,7 +964,6 @@ let drillFx: { hole: number; t: number; popped: boolean } | null = null;
 /** Open one more hole in the tray with a drill (rules first; the view catches up). */
 function openSlot(): void {
   addSlot(S);
-  for (const h of history) h.s.cap = S.cap;
   drillFx = { hole: S.cap - 1, t: 0, popped: false };
   syncSpare();
   sfx.drill();
@@ -982,21 +1059,23 @@ let coach: { steps: CoachStep[]; i: number; t: number } | null = null;
 /** The next good move (careful bot), remembered until the board changes. */
 let hintMemo: { key: string; move: [number, number] } = { key: '', move: [-1, -1] };
 function bestMove(): [number, number] {
-  const key = S.end.join(',') + S.gone.map((g) => (g ? 1 : 0)).join('') + S.spare.join('') + S.trays.map((t) => t.c + ':' + t.n).join(',');
+  const key = board.handles.map((h) => (h.gone ? -1 : h.slot)).join(',') + S.spare.join('') + S.trays.map((t) => t.c + ':' + t.n).join(',');
   if (hintMemo.key !== key) {
-    const k0 = S.end.findIndex((_, k) => pinBlocked(k) === null);
-    hintMemo = { key, move: solve(S, 6)?.[0] ?? [k0, emptyHoles(S)[0] ?? -1] };
+    // the level's untangling line: the first of its moves not made yet
+    const next = lv.solution.find(([k, sl]) => !board.handles[k].gone && board.handles[k].slot !== sl && board.slots[sl].handle < 0 && board.pickBlock(k) === null);
+    const k0 = board.handles.findIndex((_, k) => board.pickBlock(k) === null);
+    hintMemo = { key, move: next ?? [k0, board.slots.findIndex((sl) => sl.exists && sl.type === 'normal' && sl.handle < 0)] };
   }
   return hintMemo.move;
 }
-const bestPin = () => { const [k] = bestMove(); return k >= 0 && !S.gone[k >> 1] ? scene.holeScreen(S.end[k], 0.2) : null; };
+const bestPin = () => { const [k] = bestMove(); return k >= 0 && !board.handles[k].gone ? scene.pinScreen(k) : null; };
 const bestHole = () => { const [, h] = bestMove(); return h >= 0 ? scene.holeScreen(h) : null; };
-const bestOnly = (w: string) => { const [k, h] = bestMove(); return w === `p${k}` || w === `m${k}:${h}`; };
+const bestOnly = (w: string) => { const [k] = bestMove(); return w === `p${k}`; };
 const ropeAt = (i: number) => (i >= 0 && !S.gone[i] ? scene.toScreen(scene.midOf(i)) : null);
-/** The live rope with the most crossings (the scissors lesson cuts it). */
-const knottiest = () => S.ropes.reduce((b, _, i) => (S.gone[i] ? b : b < 0 || tangled(S, i).length > tangled(S, b).length ? i : b), -1);
-/** A rope on the board caught under (or hooked round) another one, or -1. */
-const caughtRope = () => S.ropes.findIndex((_, i) => !S.gone[i] && S.ropes.some((__, j) => j !== i && !S.gone[j] && caught(S, i, j)));
+/** The live rope touching the most other groups (the scissors lesson cuts it). */
+const knottiest = () => S.ropes.reduce((b, _, i) => (S.gone[i] ? b : b < 0 || board.touchCount(i) > board.touchCount(b) ? i : b), -1);
+/** A rope on the board tangled with another group, not the one to move next. */
+const caughtRope = () => { const m = board.handles[bestMove()[0]]?.ropes[0] ?? -1; return S.ropes.findIndex((_, i) => !S.gone[i] && i !== m && board.touchCount(i) > 0); };
 const basketAt = () => ({ x: L.basket.x + L.basket.w / 2, y: L.basket.y + L.basket.w * TRAY_H * 0.5 });
 const boosterPoint = (k: BoosterKey) => { const p = boosterAt(BOOSTERS.indexOf(k)); return { x: p.x, y: p.y }; };
 
@@ -1007,10 +1086,10 @@ function setupTutorial(): void {
     // first game: step by step, until the first toy part is knitted
     steps.push(
       { text: 'Welcome! Untangle the ropes to knit this cute toy.', at: () => scene.toyCenter(), until: 'tap', t: 5, r: L.u * 0.22 },
-      { text: 'Drag a pin into an empty hole to untangle the ropes!', at: bestPin, to: bestHole, allow: bestOnly, until: 'move', r: L.u * 0.3 },
-      { text: 'A rope that crosses nothing comes off by itself. Keep going!', at: bestPin, to: bestHole, allow: bestOnly, until: 'pull', r: L.u * 0.3 },
+      { text: 'Drag a pin into an empty slot to untangle the ropes!', at: bestPin, to: bestHole, allow: bestOnly, until: 'move', r: L.u * 0.3 },
+      { text: 'Ropes that touch no other rope come off by themselves. Keep going!', at: bestPin, to: bestHole, allow: bestOnly, until: 'pull', r: L.u * 0.3 },
       { text: 'It rolls into a ball and drops into the tray of its color.', at: basketAt, until: 'tap', t: 4, r: L.u * 0.22 },
-      { text: 'Ropes can\u2019t pass through each other. A rope lying under another stays caught — move the one on top first!', at: () => ropeAt(caughtRope()), until: 'tap', t: 6 },
+      { text: 'Ropes can\u2019t pass through each other — and a rope pulled too tight snaps its pin back. Find the right order!', at: () => ropeAt(caughtRope()), until: 'tap', t: 6 },
       { text: 'Fill the tray with three of its color — keep going!', at: bestPin, to: bestHole, allow: bestOnly, until: 'knit', r: L.u * 0.3 },
       { text: 'Tray full! The three balls knit a part of the toy, and the next tray slides in.', at: () => scene.toyCenter(), until: 'tap', t: 4, r: L.u * 0.22 },
       { text: 'No open tray for a color? The ball waits in a spare slot. If all four fill up, you lose!', at: () => { const a = spareXY(0), b = spareXY(S.cap - 1); return { x: (a.x + b.x) / 2, y: a.y }; }, until: 'tap', t: 6, r: L.u * 0.26 },
@@ -1022,7 +1101,6 @@ function setupTutorial(): void {
     // second game: zoom and settings
     const zp = () => { const b = zoomButtons()[0]; return { x: b.x, y: b.y }; };
     steps.push(
-      { text: 'Tip: you can also tap a pin, then tap an empty hole.', at: bestPin, to: bestHole, until: 'tap', t: 5, r: L.u * 0.3 },
       { text: 'Busy board? Tap the magnifier (or pinch) to zoom in. Drag the board to look around.', at: zp, allow: (w) => w === 'z', until: 'zoom', t: 7, r: L.u * 0.08 },
       { text: 'Sound, music, vibration and restart are under the gear.', at: () => ({ x: L.gear.x, y: L.gear.y }), until: 'tap', t: 4, r: L.u * 0.09 },
     );
@@ -1037,7 +1115,7 @@ function setupTutorial(): void {
       if (lesson.length) introQueue.push(() => { coach = { steps: lesson, i: 0, t: 0 }; });
     }
   }
-  for (const b of ['hidden'] as const) {
+  for (const b of Object.keys(INTRO) as (keyof typeof INTRO)[]) {
     if (level + 1 === BLOCKER_AT[b] && !save.seen[`k_${b}`]) {
       save.seen[`k_${b}`] = true;
       introQueue.push(() => { popup = { kind: 'intro', t: 0, blocker: b }; });
@@ -1053,20 +1131,15 @@ function setupTutorial(): void {
 /** A guided first use of each booster, right after its card. */
 function boosterCoach(k: BoosterKey): CoachStep[] {
   const r = L.u * 0.11;
-  if (k === 'undo') return [
-    { text: 'Move any pin…', at: bestPin, to: bestHole, until: 'move', r: L.u * 0.3 },
-    { text: '…now tap Undo to put it back!', at: () => boosterPoint('undo'), allow: (w) => w === 'b_undo', until: 'booster', r },
-    { text: 'Undo takes back your last move. Handy when the spare slots get tight!', until: 'tap', t: 4 },
-  ];
   if (k === 'scissors') return [
     { text: 'Tap Scissors.', at: () => boosterPoint('scissors'), allow: (w) => w === 'b_scissors', until: 'booster', r },
     { text: 'Now tap the most tangled rope — snip!', at: () => ropeAt(knottiest()), until: 'snip' },
   ];
-  if (S.cap >= MAX_CAP) return [];
-  return [
-    { text: 'Tap +Slot to add one more spare slot!', at: () => boosterPoint('slot'), allow: (w) => w === 'b_slot', until: 'booster', r },
-    { text: 'More spare slots = more room while you wait for the right tray.', at: () => spareXY(S.cap - 1), until: 'tap', t: 4, r: L.u * 0.14 },
-  ];
+  if (k === 'hammer') {
+    const target = () => { const k2 = board.handles.findIndex((h) => !h.gone && h.fixed && h.converted === null); return k2 >= 0 ? scene.pinScreen(k2) : null; };
+    return [{ text: 'Tap Hammer, then tap a nailed pin to free it!', at: () => boosterPoint('hammer'), allow: (w) => w === 'b_hammer', until: 'booster', r }, { text: 'Smash it!', at: target, until: 'tap', t: 6 }];
+  }
+  return [];
 }
 function blockerCoach(b: keyof typeof INTRO): CoachStep[] {
   const first = (f: (i: number) => boolean) => S.ropes.findIndex((_, i) => !S.gone[i] && f(i));
@@ -1074,7 +1147,23 @@ function blockerCoach(b: keyof typeof INTRO): CoachStep[] {
     const i = first((k) => !revealed[k]);
     return i < 0 ? [] : [{ text: 'This grey rope is a mystery. Untangle it to see its color!', at: () => ropeAt(i), until: 'tap', t: 4 }];
   }
-  return [];
+  const handle = (f: (k: number) => boolean) => { const k = board.handles.findIndex((h, q) => !h.gone && f(q)); return k >= 0 ? () => scene.pinScreen(k) : null; };
+  const slot = (f: (q: number) => boolean) => { const q = board.slots.findIndex((_, i) => f(i)); return q >= 0 ? () => scene.holeScreen(q) : null; };
+  const H = board.handles, Sl = board.slots;
+  const at = b === 'pair' ? handle((k) => H[k].ropes.length > 1)
+    : b === 'fixed' || b === 'dynFixed' ? handle((k) => H[k].fixed && H[k].converted === null && !H[k].toggle)
+    : b === 'converted' ? handle((k) => H[k].converted !== null)
+    : b === 'rail' ? handle((k) => H[k].rail !== null)
+    : b === 'toFixed' ? handle((k) => H[k].toFixedTime !== null)
+    : b === 'gear' ? handle((k) => H[k].gear > 0)
+    : b === 'multi' ? handle((k) => H[k].cells.length > 1)
+    : b === 'toggle' ? handle((k) => H[k].toggle)
+    : b === 'umbrella' ? slot((q) => !!Sl[q].umbrella)
+    : b === 'pillar' ? slot((q) => Sl[q].pillar > 0)
+    : b === 'trap' ? (board.traps.length ? () => scene.holeScreen(board.traps[0].slots[Math.floor(board.traps[0].slots.length / 2)]) : null)
+    : b === 'longMap' ? () => ({ x: L.colX + L.colW / 2, y: L.H * 0.78 })
+    : slot((q) => Sl[q].exists && Sl[q].type === 'forbidden');
+  return at ? [{ text: INTRO[b].text, at, until: 'tap', t: 4 }] : [];
 }
 
 function runQueue(): void { const f = introQueue.shift(); if (f) f(); }
@@ -1118,30 +1207,20 @@ function onTap(x: number, y: number): void {
   }
   if (ended && !(armed === 'scissors' && freeSnip)) return;
   if (armed === 'scissors') {
-    const i = scene.pick(x, y);
-    if (i < 0) armed = null; else snip(i);
+    const t = scene.pick(x, y);
+    if (!t) { armed = null; board.tool = 'normal'; } else snip(t.rope, t.bead);
     return;
   }
-  if (busy) return;
-  // tap a pin to pick it up, then tap an empty hole to put it there
-  const k = scene.pickPin(x, y);
-  if (k >= 0) {
-    if (k === selected) { selected = -1; scene.select(-1); return; }
-    if (pinBlocked(k)) { nope(k); return; }
-    if (!coachAllows(`p${k}`)) return;
-    selected = k;
-    scene.select(k);
-    sfx.tap();
-    haptic(6);
+  if (armed === 'hammer') {
+    const f = fingerAt(x, y), t = f ? board.hammerTarget(f) : null;
+    if (!t) { showToast('Nothing to smash there'); return; }   // a miss costs nothing
+    board.hammer(t);
+    spend('hammer');
+    armed = null; board.tool = 'normal';
+    coachEvent('tap');
     return;
   }
-  if (selected >= 0) {
-    const h = scene.pickHole(x, y);
-    const k2 = selected;
-    selected = -1;
-    scene.select(-1);
-    if (h >= 0 && pinAt(S, h) < 0) void movePin(k2, h, 0.22);
-  }
+  if (armed === 'expand') { board.cancelExpansion(); armed = null; return; }
 }
 let selected = -1;   // tap mode: the pin picked up, waiting for a hole
 
@@ -1165,6 +1244,7 @@ async function popupTap(x: number, y: number): Promise<void> {
     case 'retry':
     case 'restart':
       popup = null;
+      save.wins = 0; persist();
       events.emit('lose', { canRevive: false });
       startLevel(level);
       break;
@@ -1190,12 +1270,13 @@ async function popupTap(x: number, y: number): Promise<void> {
       // two taps: the first arms it (3 s), the second wipes progress and starts over at level 1
       if (clearArm <= 0) { clearArm = 3; sfx.warn(); break; }
       clearArm = 0;
-      save.b = { undo: 2, scissors: 2, slot: 1 };
+      save.b = { scissors: 2, hammer: 2, expand: 1 };
       save.seen = {};
       save.wardrobe = [];
       persist();
       popup = null;
       sfx.close();
+      save.wins = 0; persist();
       events.emit('lose', { canRevive: false });
       startLevel(0);
       showToast('Progress cleared');
@@ -1232,6 +1313,16 @@ canvas.addEventListener('pointerdown', (e) => {
     const tapStep = coach && coach.steps[coach.i].until === 'tap';
     const pin = !armed && !ended && !busy && !tapStep && banner.t <= 0.3 ? scene.pickPin(p.x, p.y) : -1;
     held = { id: e.pointerId, x0: p.x, y0: p.y, x: p.x, y: p.y, moved: false, pin, carry: false };
+    // touch a handle: the rules pick it up (if they can) and it follows the finger
+    if (pin >= 0) {
+      if (!coachAllows(`p${pin}`)) { held.pin = -1; return; }
+      const why = board.pickBlock(pin);
+      if (why === 'fixed') { nope(pin, why); held.pin = -1; return; }
+      board.setFinger(fingerAt(p.x, p.y));
+      board.press(pin);
+      held.carry = true;
+      held.moved = true;
+    }
     return;
   }
   onTap(p.x, p.y);
@@ -1243,19 +1334,7 @@ canvas.addEventListener('pointermove', (e) => {
   if (pinch && pointers.size >= 2) { scene.setZoom(pinch.z0 * (spread() / pinch.d0)); coachEvent('zoom'); return; }
   if (held && held.id === e.pointerId) {
     const far = Math.hypot(p.x - held.x0, p.y - held.y0) > 9;
-    if (held.pin >= 0 && !held.carry && far && !busy) {
-      held.moved = true;
-      if (pinBlocked(held.pin) || !coachAllows(`p${held.pin}`)) { if (pinBlocked(held.pin)) nope(held.pin); held.pin = -1; }
-      else {
-        held.carry = true;
-        selected = -1;
-        scene.select(-1);
-        scene.beginDrag(held.pin);
-        sfx.tap();
-        haptic(6);
-      }
-    }
-    if (held.carry) scene.dragTo(p.x, p.y);
+    if (held.carry) board.setFinger(fingerAt(p.x, p.y));
     else if (held.pin < 0) {
       if (!held.moved && far && scene.zoomLevel > 1.01) held.moved = true;
       if (held.moved) scene.panBy(p.x - held.x, p.y - held.y);
@@ -1263,6 +1342,8 @@ canvas.addEventListener('pointermove', (e) => {
     held.x = p.x; held.y = p.y;
   }
 });
+// the touch is lost (app loses focus): the carried handle lets go (spec §4)
+window.addEventListener('blur', () => { board.up(); held = null; });
 const release = (e: PointerEvent) => {
   pointers.delete(e.pointerId);
   if (pointers.size < 2) pinch = null;
@@ -1270,10 +1351,8 @@ const release = (e: PointerEvent) => {
     const h = held;
     held = null;
     if (h.carry) {
-      // drop: into the nearest empty hole, or back where it came from
-      const to = scene.pickHole(h.x, h.y, 2.2);
-      if (to >= 0 && pinAt(S, to) < 0 && e.type === 'pointerup') void movePin(h.pin, to);
-      else { busy++; void scene.endDrag(S.end[h.pin], S.end, 0.16).then(() => { busy--; }); sfx.nope(); }
+      // let go: the rules drop the handle into the active slot, or fly it back
+      board.up();
     } else if (!h.moved && e.type === 'pointerup') onTap(h.x0, h.y0);
   }
 };
@@ -1321,8 +1400,11 @@ function update(dt: number): void {
   for (let k = timers.length - 1; k >= 0; k--) if (timers[k].t <= clock) timers.splice(k, 1)[0].res();
   for (const b of balls) {
     const s = ballXY(b);
+    const held = b.holdUntil !== undefined && clock < b.holdUntil;
+    if (b.holdUntil !== undefined && !held && b.t >= 1 && b.landAt === undefined) b.landAt = clock + 0.12;
     if (b.t < 1) {
       b.t = Math.min(1, b.t + dt / b.dur);
+      if (b.t >= 1 && b.holdUntil === undefined) b.landAt = clock;
       const e = ease(Math.max(0, b.t));
       b.x = b.x0 + (s.x - b.x0) * e;
       b.y = b.y0 + (s.y - b.y0) * e - Math.sin(Math.PI * Math.max(0, b.t)) * L.u * 0.12;
@@ -1391,9 +1473,17 @@ function update(dt: number): void {
     const st = coach.steps[coach.i];
     if (st.t && coach.t > st.t) coachEvent('tap');
   }
+  // the rules: groups come off only while nothing is in the way (no popup, no tutorial card)
+  board.canUntie = !popup && !show && banner.t <= 0;
+  board.waitForResult = ended || !!popup || !!show;
+  onBoard(board.update(dt));
+  if (board.started && !ended && !popup) {
+    stats.time += dt;
+    try { (FalconSDK as unknown as { analytics?: { turn?: { tick?(d: number): void } } }).analytics?.turn?.tick?.(dt); } catch { /* optional */ }
+  }
   scene.update(dt);
-  scene.setEmptyHoles(emptyHoles(S));
-  S.ropes.forEach((_, i) => { if (!S.gone[i]) scene.setHighlight(i, hint.t > 0 && hint.pin >> 1 === i ? 0.4 + 0.25 * Math.sin(clock * 8) : 0); });
+  const hk = hint.t > 0 && hint.pin >= 0 ? board.handles[hint.pin]?.ropes ?? [] : [];
+  S.ropes.forEach((_, i) => { if (!S.gone[i]) scene.setHighlight(i, hk.includes(i) ? 0.4 + 0.25 * Math.sin(clock * 8) : 0); });
 }
 
 // ---------------------------------------------------------------- draw (2D)
@@ -1489,12 +1579,18 @@ function drawTrays(): void {
     ctx.restore();
   }
   // a ball with nowhere to go: red ring round the extra spot
-  if (S.spare.length > S.cap) {
-    const h = spareXY(S.cap);
+  if (S.lost && S.spare.length >= S.cap) {
+    const h = spareXY(S.cap - 1);
     ctx.strokeStyle = `rgba(255,60,60,${0.6 + 0.4 * Math.sin(clock * 10)})`; ctx.lineWidth = h.r * 0.18;
     ctx.beginPath(); ctx.arc(h.x, h.y, h.r * 1.05, 0, Math.PI * 2); ctx.stroke();
   }
-  for (const ball of balls) if (ball.t >= 0) yarnBall(ball.c, ball.x, ball.y, ballR(ball) * (ball.t < 1 ? 0.7 + 0.3 * ball.t : 1));
+  for (const ball of balls) {
+    if (ball.t < 0) continue;
+    // a little bounce as it drops into its hole
+    const since = ball.landAt !== undefined ? clock - ball.landAt : 9;
+    const bounce = since >= 0 && since < 0.4 ? 1 + 0.16 * Math.exp(-since * 9) * Math.cos(since * 28) : 1;
+    yarnBall(ball.c, ball.x, ball.y, ballR(ball) * (ball.t < 1 ? 0.7 + 0.3 * ball.t : 1) * bounce);
+  }
 }
 
 /** The yarn running from an unwinding ball up to where the toy is being stitched. */
@@ -1619,7 +1715,7 @@ function drawHud(): void {
 /** The booster art is the reference cut-out (button + its label, `src/assets/b_*.png`); the count badge
  *  is painted over the one in the picture. Locked = a grey-purple copy, white lock and a "Lv.N" badge. */
 const B_IMG = {} as Record<BoosterKey, { on: HTMLCanvasElement | HTMLImageElement; off: HTMLCanvasElement | null; ok: boolean }>;
-for (const [k, jpg, mask] of [['undo', undoJpg, undoA], ['scissors', scissorsJpg, scissorsA], ['slot', slotJpg, slotA]] as [BoosterKey, string, string][]) {
+for (const [k, jpg, mask] of [['scissors', scissorsJpg, scissorsA]] as [BoosterKey, string, string][]) {
   const e = B_IMG[k] = { on: document.createElement('canvas') as HTMLCanvasElement | HTMLImageElement, off: null as HTMLCanvasElement | null, ok: false as boolean };
   e.on = maskedImage(jpg, mask, (img) => {
     // locked look: a grey-purple copy
@@ -1637,7 +1733,26 @@ for (const [k, jpg, mask] of [['undo', undoJpg, undoA], ['scissors', scissorsJpg
     e.ok = true;
   }).c;
 }
-const B_NAME: Record<BoosterKey, string> = { undo: 'Undo', scissors: 'Scissors', slot: '+Slot' };
+const B_NAME: Record<BoosterKey, string> = { scissors: 'Scissors', hammer: 'Hammer', expand: 'Expand' };
+// Hammer and Expansion have no cut-out: draw one in the same look (round blue button, icon, label under it)
+for (const k of ['hammer', 'expand'] as BoosterKey[]) {
+  const W = 240, H = 300, c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d')!, cx = W / 2, cy = H * 0.462, R0 = W * 0.47;
+  g.fillStyle = '#1d2f8a'; g.beginPath(); g.arc(cx, cy + 6, R0, 0, Math.PI * 2); g.fill();
+  const rim = g.createLinearGradient(0, cy - R0, 0, cy + R0);
+  rim.addColorStop(0, '#9fd2ff'); rim.addColorStop(1, '#2c62d8');
+  g.fillStyle = rim; g.beginPath(); g.arc(cx, cy, R0, 0, Math.PI * 2); g.fill();
+  const face = g.createLinearGradient(0, cy - R0, 0, cy + R0);
+  face.addColorStop(0, '#62b4ff'); face.addColorStop(1, '#2350c8');
+  g.fillStyle = face; g.beginPath(); g.arc(cx, cy, R0 * 0.86, 0, Math.PI * 2); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.28)'; g.beginPath(); g.ellipse(cx - R0 * 0.1, cy - R0 * 0.5, R0 * 0.5, R0 * 0.18, -0.2, 0, Math.PI * 2); g.fill();
+  g.save(); g.translate(cx, cy); boosterIcon(g, k, R0 * 0.82); g.restore();
+  outlinedText(g, B_NAME[k], cx, H * 0.93, 40, '#ffffff', '#1d2f8a');
+  const off = document.createElement('canvas');
+  off.width = W; off.height = H;
+  B_IMG[k] = { on: c, off, ok: true };
+}
 const B_R = 0.498, B_CY = 0.462, B_BX = 0.327, B_BY = -0.338, B_BR = 0.152;   // measured on the cut-outs (× image width)
 
 function boosterArt(k: BoosterKey, x: number, y: number, r: number, count: number, lockedAt: number, press: number, pulse: number, armed: boolean): void {
@@ -1791,7 +1906,7 @@ function drawBoosters(): void {
   // no toolbar, no stands: the three buttons float on the sky, as in the reference
   BOOSTERS.forEach((k, i) => {
     const p = boosterAt(i);
-    const pulse = !boosterLocked(k) && k === 'slot' && room(S) <= 1 && S.cap < MAX_CAP && !ended ? Math.sin(clock * 8) : 0;
+    const pulse = 0;
     boosterArt(k, p.x, p.y, L.boostR, save.b[k], boosterLocked(k), press.get(k) ?? 0, pulse, armed === k);
   });
 }
@@ -2001,6 +2116,66 @@ function introArt(b: keyof typeof INTRO, cx: number, cy: number, w: number): voi
     outlinedText(ctx, '?', cx - w * 0.2, cy, w * 0.07, '#6d6880', '#ffffff');
     outlinedText(ctx, '\u2192', cx, cy, w * 0.08, '#ffffff', '#0b2563');
     rope(cx + w * 0.08, cy + w * 0.06, cx + w * 0.32, cy - w * 0.06, YARN[3].color);
+    return;
+  }
+  const pin = (x: number, y: number, col: string, r = w * 0.055) => {
+    ctx.fillStyle = '#16161e'; ctx.beginPath(); ctx.arc(x, y, r * 1.12, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = shade(col, -0.25); ctx.beginPath(); ctx.arc(x, y, r * 0.55, 0, Math.PI * 2); ctx.fill();
+  };
+  const blue = YARN[1].color, pink = YARN[0].color;
+  if (b === 'pair') {
+    rope(cx - w * 0.3, cy + w * 0.05, cx, cy - w * 0.05, blue);
+    rope(cx, cy - w * 0.05, cx + w * 0.3, cy + w * 0.05, blue);
+    pin(cx - w * 0.3, cy + w * 0.05, blue); pin(cx + w * 0.3, cy + w * 0.05, blue); pin(cx, cy - w * 0.05, blue, w * 0.07);
+  } else if (b === 'forbidden') {
+    ctx.fillStyle = '#c9c6cf'; ctx.beginPath(); ctx.arc(cx, cy, w * 0.09, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#e8443b'; ctx.lineWidth = w * 0.025; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(cx - w * 0.05, cy - w * 0.05); ctx.lineTo(cx + w * 0.05, cy + w * 0.05); ctx.moveTo(cx + w * 0.05, cy - w * 0.05); ctx.lineTo(cx - w * 0.05, cy + w * 0.05); ctx.stroke();
+  } else if (b === 'fixed') {
+    rope(cx - w * 0.28, cy + w * 0.04, cx + w * 0.02, cy, pink);
+    pin(cx + w * 0.02, cy, pink, w * 0.08);
+    ctx.fillStyle = '#c9ccd6'; ctx.strokeStyle = '#6b7080'; ctx.lineWidth = w * 0.008;
+    ctx.beginPath(); ctx.arc(cx + w * 0.02, cy, w * 0.035, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  } else if (b === 'pillar') {
+    rope(cx - w * 0.3, cy + w * 0.05, cx - w * 0.04, cy - w * 0.02, pink);
+    rope(cx - w * 0.04, cy - w * 0.02, cx + w * 0.3, cy + w * 0.05, pink);
+    ctx.fillStyle = '#b98256'; roundRect(ctx, cx - w * 0.03, cy - w * 0.16, w * 0.06, w * 0.16, w * 0.02); ctx.fill();
+    ctx.fillStyle = '#e8443b'; ctx.beginPath(); ctx.arc(cx, cy - w * 0.16, w * 0.035, 0, Math.PI * 2); ctx.fill();
+  } else if (b === 'rail') {
+    ctx.fillStyle = '#7a8396'; roundRect(ctx, cx - w * 0.3, cy - w * 0.015, w * 0.6, w * 0.03, w * 0.015); ctx.fill();
+    pin(cx - w * 0.05, cy, blue);
+    outlinedText(ctx, '\u2194', cx, cy - w * 0.1, w * 0.08, '#ffffff', '#0b2563');
+  } else if (b === 'umbrella') {
+    for (let t = 0; t < 6; t++) { ctx.fillStyle = t % 2 ? '#ffffff' : '#ff5a6e'; ctx.beginPath(); ctx.moveTo(cx, cy - w * 0.14); ctx.arc(cx, cy - w * 0.02, w * 0.2, Math.PI + (t / 6) * Math.PI, Math.PI + ((t + 1) / 6) * Math.PI); ctx.fill(); }
+    ctx.strokeStyle = '#5b3a22'; ctx.lineWidth = w * 0.012; ctx.beginPath(); ctx.moveTo(cx, cy - w * 0.14); ctx.lineTo(cx, cy + w * 0.12); ctx.stroke();
+  } else if (b === 'toFixed') {
+    pin(cx, cy, pink, w * 0.08);
+    ctx.strokeStyle = '#ffb020'; ctx.lineWidth = w * 0.022; ctx.beginPath(); ctx.arc(cx, cy, w * 0.11, -Math.PI / 2, Math.PI * 0.9); ctx.stroke();
+  } else if (b === 'gear') {
+    pin(cx - w * 0.14, cy, pink, w * 0.07); pin(cx + w * 0.14, cy, blue, w * 0.07);
+    for (const x of [cx - w * 0.14, cx + w * 0.14]) { ctx.strokeStyle = '#f2b23a'; ctx.lineWidth = w * 0.015; ctx.beginPath(); ctx.arc(x, cy, w * 0.03, 0, Math.PI * 2); ctx.stroke(); }
+    outlinedText(ctx, '\u21c4', cx, cy - w * 0.1, w * 0.07, '#ffffff', '#0b2563');
+  } else if (b === 'multi') {
+    ctx.fillStyle = pink; roundRect(ctx, cx - w * 0.16, cy - w * 0.05, w * 0.32, w * 0.1, w * 0.05); ctx.fill();
+    pin(cx - w * 0.11, cy, pink, w * 0.05); pin(cx + w * 0.11, cy, pink, w * 0.05);
+  } else if (b === 'toggle' || b === 'dynFixed') {
+    pin(cx, cy, pink, w * 0.08);
+    ctx.globalAlpha = 0.5 + 0.5 * Math.sin(clock * 6);
+    ctx.fillStyle = '#c9ccd6'; ctx.beginPath(); ctx.arc(cx, cy, w * 0.035, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  } else if (b === 'longMap') {
+    for (let r = 0; r < 4; r++) { ctx.fillStyle = r < 2 ? '#dcdce2' : 'rgba(220,220,226,0.35)'; roundRect(ctx, cx - w * 0.14, cy - w * 0.12 + r * w * 0.07, w * 0.28, w * 0.05, w * 0.02); ctx.fill(); }
+    outlinedText(ctx, '\u2193', cx + w * 0.22, cy, w * 0.09, '#ffffff', '#0b2563');
+  } else if (b === 'trap') {
+    ctx.fillStyle = '#9a6a3e'; roundRect(ctx, cx - w * 0.16, cy - w * 0.1, w * 0.32, w * 0.2, w * 0.03); ctx.fill();
+    ctx.strokeStyle = '#8b8f99'; ctx.lineWidth = w * 0.012; ctx.beginPath(); ctx.moveTo(cx - w * 0.16, cy - w * 0.04); ctx.lineTo(cx + w * 0.16, cy - w * 0.04); ctx.moveTo(cx - w * 0.16, cy + w * 0.04); ctx.lineTo(cx + w * 0.16, cy + w * 0.04); ctx.stroke();
+  } else if (b === 'converted') {
+    rope(cx - w * 0.28, cy + w * 0.04, cx + w * 0.02, cy, pink);
+    pin(cx + w * 0.02, cy, pink, w * 0.08);
+    ctx.strokeStyle = CFG.convertedColors[1]; ctx.lineWidth = w * 0.02;
+    ctx.beginPath(); ctx.arc(cx + w * 0.02, cy, w * 0.068, 0, Math.PI * 2); ctx.stroke();
+    outlinedText(ctx, '2', cx + w * 0.2, cy - w * 0.06, w * 0.07, '#ffffff', '#8a6a00');
   }
 }
 
@@ -2159,33 +2334,46 @@ if (import.meta.env.DEV) {
     closePopup: () => { popup = null; coach = null; introQueue = []; },
     showPopup: (kind: 'win' | 'full' | 'stuck' | 'settings', spare?: number[]) => { if (spare) S.spare = spare; popup = { kind, t: 0 }; },
     plan: () => ({ color: plan.color, steps: [...plan.steps.entries()], knitLog, parts: scene.partInfo() }),
-    info: () => ({ level: level + 1, holes: S.holes, end: S.end, colors: S.ropes.map((t) => t.c), ropes: S.ropes.length, gone: S.gone.filter(Boolean).length, trays: S.trays, queue: S.queue, next: S.next, spare: S.spare, cap: S.cap, unlocked: S.unlocked, lock: S.lock, knitted: S.knitted, lost: S.lost, ended, popup: popup?.kind ?? null, popupT: popup?.t ?? 0, paused, banner: banner.t, coach: coach?.i ?? null, busy, empty: emptyHoles(S), locked: S.ropes.map((_, i) => (lockedOn(S, i) ? i : -1)).filter((i) => i >= 0) }),
+    info: () => ({ level: level + 1, slots: board.slots.map((sl) => ({ row: sl.row, col: sl.col, type: sl.type, handle: sl.handle, exists: sl.exists })), handles: board.handles.map((h) => ({ slot: h.slot, state: h.state, gone: h.gone, fixed: h.fixed, converted: h.converted })), groups: board.groups.map((g) => g.state), colors: S.ropes.map((t) => t.c), ropes: S.ropes.length, gone: S.gone.filter(Boolean).length, trays: S.trays, queue: S.queue, next: S.next, spare: S.spare, cap: S.cap, knitted: S.knitted, lost: S.lost, ended, popup: popup?.kind ?? null, popupT: popup?.t ?? 0, paused, banner: banner.t, coach: coach?.i ?? null, busy, moves: board.moves, warn: board.warn.slice() }),
     skipCoach: () => { coach = null; banner.t = 0; },
-    pin: (k: number) => scene.holeScreen(S.end[k], 0.2),
+    pin: (k: number) => scene.pinScreen(k),
     hole: (h: number) => scene.holeScreen(h),
-    moveDirect: (k: number, h: number) => movePin(k, h),
     best: () => bestMove(),
-    /** A move that would hook the rope round another one (testing). */
-    findHook: () => {
-      for (let k = 0; k < S.end.length; k++) if (!S.gone[k >> 1] && !pinBlocked(k)) for (const h of emptyHoles(S)) if (relateRow(S, k >> 1, k & 1, S.holes[h]).includes(3)) return [k, h];
-      return null;
-    },
-    rel: () => Array.from(S.rel),
+    touching: (i: number) => board.touchCount(i),
+    solution: () => lv.solution,
+    stats: () => ({ ...stats, trace: stats.trace.slice(-40) }),
+    /** Carry handle k to slot sl with a pretend finger (as a player would), resolving once it is down. */
+    carry: (k: number, sl: number) => carryTo(k, sl),
     async auto(): Promise<boolean> {
       coach = null;
       banner.t = 0;
-      const sol = solve(S);
-      if (!sol) return false;
-      for (const [k, h] of sol) {
+      // play the level's untangling line
+      for (const [k, sl] of lv.solution) {
         while (busy || popup) await new Promise((r) => setTimeout(r, 40));
         if (ended) break;
-        await movePin(k, h);
-        await new Promise((r) => setTimeout(r, 120));
+        if (board.handles[k].gone || board.handles[k].slot === sl || board.slots[sl].handle >= 0) continue;
+        await carryTo(k, sl);
+        await new Promise((r) => setTimeout(r, 600));
       }
-      return true;
+      await new Promise((r) => setTimeout(r, 1500));
+      return S.gone.every(Boolean);
     },
     hint: () => { const [k, h] = bestMove(); hint = { pin: k, hole: h, t: 3 }; },
   };
+}
+
+/** Dev: carry handle k into slot sl with a pretend finger, frame by frame. */
+async function carryTo(k: number, sl: number): Promise<void> {
+  const p = board.handlePos(k), t = board.slots[sl];
+  const f0: [number, number] = [p[0], p[2] + CFG.distanceFromFinger], f1: [number, number] = [t.x, t.z + CFG.distanceFromFinger];
+  const frameWait = () => new Promise((r) => setTimeout(r, 16));
+  board.setFinger(f0);
+  board.press(k);
+  await frameWait(); await frameWait();
+  for (let q = 1; q <= 30; q++) { board.setFinger([f0[0] + ((f1[0] - f0[0]) * q) / 30, f0[1] + ((f1[1] - f0[1]) * q) / 30]); await frameWait(); }
+  for (let q = 0; q < 10; q++) await frameWait();
+  board.up();
+  for (let q = 0; q < 200 && board.handles[k].state !== 'stable' && !board.handles[k].gone; q++) await frameWait();
 }
 
 /** What the studio layer attaches to. See falcon-game.ts for every member. */

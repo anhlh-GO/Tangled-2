@@ -1,119 +1,98 @@
-// The 3D view (three.js): a light board with holes in the level's shape, ring pins
-// in them and glossy ropes (dark outline, as in the reference) between the pins.
-// Every pair of ropes lies as the rules say (sim.ts `rel`): where they cross, the
-// top one arches over the other exactly as high as that one lies there; a hooked
-// rope bends to the other rope, goes under it and loops back over it. The game
-// drives it with plain calls; this file owns no rules.
-
-import { NONE, OVER, UNDER, WRAP, WRAPPED } from './sim';
+// The 3D view (three.js) of the board as board.ts has it: slots (the active one ringed,
+// forbidden ones crossed out, previews faint), handles (fixed ones nailed down, converted
+// ones ringed in the colour of their moves left) and glossy ropes (dark outline, as in the
+// reference) drawn from the rope physics every frame; a rope stretched past the warning
+// rate turns orange, then red. This file owns no rules: the game steps the board.
 
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import { RAW, buildToy, type Toy } from './items3d';
+import { END_Y, PILLAR_R, PIN_R, R } from './rope';
+import type { Board } from './board';
+import { CFG } from './config';
 
-const PIN_R = 0.35;     // pin radius
 const PIN_H = 0.2;      // pin height
-const R = 0.115;        // rope radius
-const H0 = PIN_H + 0.06;   // ropes lie at the height of the pin tops
-const LIFT = 0.32;      // a carried pin floats this high (its rope keeps its layer)
-const STACK = R * 1.95; // a rope lying on another sits this much higher
 
 interface PinMesh { group: THREE.Group; body: THREE.MeshPhysicalMaterial; top: THREE.MeshStandardMaterial; rim: THREE.MeshBasicMaterial }
-interface RopeView { group: THREE.Group; tube: THREE.Mesh | null; line: THREE.Mesh | null; hit: THREE.Mesh | null; caps: THREE.Mesh[]; mat: THREE.MeshPhysicalMaterial; pins: [PinMesh, PinMesh]; color: THREE.Color; mid: THREE.Vector3; segs: number; anim: number; shake: number; flash: number; glow: number; dim: boolean; gone: boolean; ball: THREE.Group | null; bump: [number, number]; mystery?: THREE.Sprite }
-/** Where a rope passes over a lower one: at distance sc along it, as high as `peak`, flat for ±half, easing down over `ramp`. */
-interface Bump { sc: number; peak: number; half: number; ramp: number }
+/** A rope of the physics (cut ropes leave two halves: each a view of its own, coloured as the rope it came from). */
+interface RopeView { group: THREE.Group; tube: THREE.Mesh; line: THREE.Mesh; buf: TubeBuf; lbuf: TubeBuf; mat: THREE.MeshPhysicalMaterial; color: THREE.Color; mid: THREE.Vector3; segs: number; n: number; anim: number; flash: number; glow: number; gone: boolean; ball: THREE.Group | null; mystery?: THREE.Sprite; owner: number; shown: string }
+interface HandleView { pin: PinMesh; nail: THREE.Group; ring: THREE.Mesh; ringMat: THREE.MeshStandardMaterial; bump: number; color: THREE.Color; cog: THREE.Group | null; timer: THREE.Mesh | null; timerAt: number }
+interface SlotView { dish: THREE.Mesh; mat: THREE.MeshStandardMaterial; lip: THREE.Mesh; ring: THREE.Mesh; cross: THREE.Group; kind: string }
 const DIM = 0.55;   // the rope held by the padlock is drawn this much darker
-const HIT_MAT = new THREE.MeshBasicMaterial({ visible: false });
+const WARN = new THREE.Color(CFG.warningColor), SNAP = new THREE.Color(CFG.snapColor);
 
-interface Ctrl { x: number; z: number; y: number }
 /**
- * A rope's way across the board: a polyline through its pins (and round any hooks)
- * with a height profile — the control heights, lifted over lower ropes by bumps,
- * the ends sinking into the pins. Inside a hook the loop keeps its own heights.
+ * A rope's tube, rebuilt in place every frame from its beads: a smooth curve through
+ * them, three twisted plies bulging round it (grooves shaded by vertex colour).
  */
-class RopePath {
-  readonly cum: number[] = [0];
-  readonly len: number;
-  bumps: Bump[] = [];
-  hookBumps: Bump[] = [];
-  /** Where a rope lies on this one: pressed down a little (peak = depth), and darker there (contact shade). */
-  dips: Bump[] = [];
-  zones: [number, number][] = [];
-  constructor(readonly pts: Ctrl[]) {
-    for (let k = 1; k < pts.length; k++) this.cum.push(this.cum[k - 1] + Math.hypot(pts[k].x - pts[k - 1].x, pts[k].z - pts[k - 1].z));
-    this.len = this.cum[pts.length - 1] || 1e-6;
-  }
-  private seg(s: number): [number, number] {
-    let k = 0;
-    while (k < this.pts.length - 2 && this.cum[k + 1] < s) k++;
-    const L = this.cum[k + 1] - this.cum[k];
-    return [k, L > 1e-9 ? Math.min(1, Math.max(0, (s - this.cum[k]) / L)) : 0];
-  }
-  xz(s: number): [number, number] {
-    const [k, u] = this.seg(s), a = this.pts[k], b = this.pts[k + 1];
-    return [a.x + (b.x - a.x) * u, a.z + (b.z - a.z) * u];
-  }
-  heightAt(s: number): number {
-    const [k, u] = this.seg(s), a = this.pts[k], b = this.pts[k + 1];
-    let y = a.y + (b.y - a.y) * u;
-    const de = Math.min(s, this.len - s);
-    if (de < 0.32) y -= (1 - de / 0.32) ** 2 * 0.16;
-    const inZone = this.zones.some(([z0, z1]) => s > z0 && s < z1);
-    for (const c of inZone ? [] : [...this.bumps, ...this.hookBumps]) {
-      const d = Math.abs(s - c.sc) - c.half;
-      const w = d <= 0 ? 1 : d >= c.ramp ? 0 : 0.5 + 0.5 * Math.cos((Math.PI * d) / c.ramp);
-      if (w > 0) y = Math.max(y, y + (c.peak - y) * w);
+class TubeBuf {
+  geo = new THREE.BufferGeometry();
+  private pos: Float32Array;
+  private col: Float32Array;
+  private c: Float32Array;   // curve samples
+  constructor(readonly segs: number, readonly radial: number, readonly r: number, readonly ply: number) {
+    const nv = (segs + 1) * (radial + 1);
+    this.pos = new Float32Array(nv * 3);
+    this.col = new Float32Array(nv * 3).fill(1);
+    this.c = new Float32Array((segs + 1) * 3);
+    const idx: number[] = [];
+    for (let i = 0; i < segs; i++) for (let j = 0; j < radial; j++) {
+      const a = i * (radial + 1) + j, b = (i + 1) * (radial + 1) + j;
+      idx.push(a, b, a + 1, b, b + 1, a + 1);
     }
-    if (!inZone) for (const c of this.dips) {
-      const d = Math.abs(s - c.sc) - c.half;
-      if (d < c.ramp) y -= c.peak * (d <= 0 ? 1 : 0.5 + 0.5 * Math.cos((Math.PI * d) / c.ramp));
+    this.geo.setIndex(idx);
+    this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+    this.geo.setAttribute('color', new THREE.BufferAttribute(this.col, 3));
+    this.geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(nv * 3), 3));
+  }
+  /** beads: x,y,z per bead (board units, already in view space). */
+  update(x: Float64Array, n: number, ox: number, oz: number): void {
+    const S = this.segs, c = this.c;
+    // centripetal-ish Catmull-Rom through the beads, sampled evenly in bead index
+    for (let i = 0; i <= S; i++) {
+      const f = (i / S) * (n - 1), k = Math.min(n - 2, Math.floor(f)), t = f - k;
+      const k0 = Math.max(0, k - 1), k3 = Math.min(n - 1, k + 2);
+      for (let d = 0; d < 3; d++) {
+        const p0 = x[k0 * 3 + d], p1 = x[k * 3 + d], p2 = x[(k + 1) * 3 + d], p3 = x[k3 * 3 + d];
+        const t2 = t * t, t3 = t2 * t;
+        c[i * 3 + d] = 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3) + (d === 0 ? ox : d === 2 ? oz : 0);
+      }
     }
-    return y;
-  }
-  /** 1 = fully lit; less where another rope lies on this one (ambient occlusion by hand). */
-  shadeAt(s: number): number {
-    let k = 1;
-    for (const c of this.dips) { const d = (s - c.sc) / (c.half + 0.22); k -= 0.42 * Math.exp(-d * d * 2.2); }
-    return Math.max(0.45, k);
-  }
-  /** Arc length of the point on the path nearest p. */
-  nearest(px: number, pz: number): number {
-    let best = 0, bd = Infinity;
-    for (let k = 0; k < this.pts.length - 1; k++) {
-      const a = this.pts[k], b = this.pts[k + 1], dx = b.x - a.x, dz = b.z - a.z, L2 = dx * dx + dz * dz || 1e-9;
-      const u = Math.max(0, Math.min(1, ((px - a.x) * dx + (pz - a.z) * dz) / L2));
-      const d = Math.hypot(a.x + dx * u - px, a.z + dz * u - pz);
-      if (d < bd) { bd = d; best = this.cum[k] + u * Math.sqrt(L2); }
+    // frames by parallel transport; plies twist along the length
+    const R0 = this.r, RA = this.radial, pos = this.pos, col = this.col;
+    let nx = 0, ny = 1, nz = 0, len = 0;
+    for (let i = 0; i <= S; i++) {
+      const a = Math.max(0, i - 1) * 3, b = Math.min(S, i + 1) * 3;
+      let tx = c[b] - c[a], ty = c[b + 1] - c[a + 1], tz = c[b + 2] - c[a + 2];
+      const tl = Math.hypot(tx, ty, tz) || 1;
+      tx /= tl; ty /= tl; tz /= tl;
+      // keep the normal square to the tangent
+      const dn = nx * tx + ny * ty + nz * tz;
+      nx -= tx * dn; ny -= ty * dn; nz -= tz * dn;
+      let nl = Math.hypot(nx, ny, nz);
+      if (nl < 1e-4) { nx = -tz; ny = 0; nz = tx; nl = Math.hypot(nx, nz) || 1; if (nl < 1e-4) { nx = 1; nz = 0; nl = 1; } }
+      nx /= nl; ny /= nl; nz /= nl;
+      const bx = ty * nz - tz * ny, by = tz * nx - tx * nz, bz = tx * ny - ty * nx;
+      if (i > 0) len += Math.hypot(c[i * 3] - c[i * 3 - 3], c[i * 3 + 1] - c[i * 3 - 2], c[i * 3 + 2] - c[i * 3 - 1]);
+      for (let j = 0; j <= RA; j++) {
+        const th = (j / RA) * Math.PI * 2, cs = -Math.cos(th), sn = Math.sin(th);
+        const w = Math.cos(3 * th - (3 * Math.PI * 2 * len) / 0.62);
+        const rr = R0 * (1 + this.ply * (Math.sqrt(Math.max(0, w * 0.5 + 0.5)) - 0.55));
+        const v = (i * (RA + 1) + j) * 3;
+        pos[v] = c[i * 3] + (nx * cs + bx * sn) * rr;
+        pos[v + 1] = c[i * 3 + 1] + (ny * cs + by * sn) * rr;
+        pos[v + 2] = c[i * 3 + 2] + (nz * cs + bz * sn) * rr;
+        if (this.ply > 0) col[v] = col[v + 1] = col[v + 2] = 0.8 + 0.2 * Math.pow(Math.max(0, w * 0.5 + 0.5), 0.55);
+      }
     }
-    return best;
+    this.geo.attributes.position.needsUpdate = true;
+    this.geo.attributes.color.needsUpdate = true;
+    this.geo.computeVertexNormals();
+    this.geo.computeBoundingSphere();
   }
-  /** The centre line in 3D, smoothed (sampled every `step`). */
-  curve(step: number): THREE.CatmullRomCurve3 {
-    const n = Math.max(2, Math.ceil(this.len / step));
-    const ps: THREE.Vector3[] = [];
-    for (let q = 0; q <= n; q++) { const s = (q / n) * this.len, [x, z] = this.xz(s); ps.push(new THREE.Vector3(x, this.heightAt(s), z)); }
-    // round off the corners (hooks, bumps), keeping the ends on the pins
-    for (let pass = 0; pass < 3; pass++) {
-      const src = ps.map((p) => p.clone());
-      for (let q = 2; q < ps.length - 2; q++) ps[q].copy(src[q - 1]).add(src[q]).add(src[q + 1]).multiplyScalar(1 / 3);
-    }
-    return new THREE.CatmullRomCurve3(ps, false, 'centripetal');
-  }
-}
-/** Where two polylines cross: arc lengths along each and the sine of the angle. */
-function crossings(p: RopePath, q: RopePath): { s: number; t: number; sin: number }[] {
-  const out: { s: number; t: number; sin: number }[] = [];
-  for (let a = 0; a < p.pts.length - 1; a++) for (let b = 0; b < q.pts.length - 1; b++) {
-    const A = p.pts[a], B = p.pts[a + 1], C = q.pts[b], D = q.pts[b + 1];
-    const rx = B.x - A.x, rz = B.z - A.z, sx = D.x - C.x, sz = D.z - C.z;
-    const den = rx * sz - rz * sx;
-    if (Math.abs(den) < 1e-9) continue;
-    const u = ((C.x - A.x) * sz - (C.z - A.z) * sx) / den, v = ((C.x - A.x) * rz - (C.z - A.z) * rx) / den;
-    if (u <= 0 || u >= 1 || v <= 0 || v >= 1) continue;
-    const lr = Math.hypot(rx, rz), ls = Math.hypot(sx, sz);
-    out.push({ s: p.cum[a] + u * lr, t: q.cum[b] + v * ls, sin: Math.abs(den) / (lr * ls) });
-  }
-  return out;
+  /** The point at the middle of the rope (view space). */
+  mid(out: THREE.Vector3): THREE.Vector3 { const k = (this.segs >> 1) * 3; return out.set(this.c[k], this.c[k + 1], this.c[k + 2]); }
+  point(i: number, out: THREE.Vector3): THREE.Vector3 { return out.set(this.c[i * 3], this.c[i * 3 + 1], this.c[i * 3 + 2]); }
 }
 
 /** A pin as in the reference: a fat glossy button in the rope's colour, a darker dished top, a dark rim. */
@@ -311,22 +290,22 @@ export class Scene3D {
   private frameOut = 0;
   /** Screen position of the board's far frame edge (unzoomed), filled each frame. */
   boardTop: { x0: number; x1: number; y: number } | null = null;
-  private lockFx: { pad: THREE.Group; shackle: THREE.Mesh; key: THREE.Group | null; keyRope: number; keyHome: THREE.Vector3; at: THREE.Vector3; t: number; open: boolean; shake: number; strands: number[] } | null = null;
   private mysteryTex = mysteryTexture();
-  private holeXY: THREE.Vector3[] = [];
-  private layers: number[] = [];
-  private paths: (RopePath | null)[] = [];
-  private rel = new Int8Array(0);
-  private shift = { x: 0, y: 0 };
-  /** While a pin is carried: how its rope would lie against every other rope with the pin at board point p. */
-  private dragRule: ((k: number, p: [number, number]) => Int8Array) | null = null;
   private bounds = { x0: -2, x1: 2, z0: -2, z1: 2 };
-  private dragAt = new THREE.Vector3(1e9, 0, 0);
-  private ends: number[] = [];
-  private holeMeshes: THREE.Mesh[] = [];
-  private emptyNow = new Set<number>();
-  private selected = -1;
-  private drag: { k: number; p: THREE.Vector3; from: THREE.Vector3; to: THREE.Vector3 | null; t: number; dur?: number; done: (() => void) | null } | null = null;
+  /** The rules being drawn. */
+  private rules: Board | null = null;
+  private handles: HandleView[] = [];
+  private slotViews: SlotView[] = [];
+  private ropeColors: string[] = [];
+  private mysteryOf: boolean[] = [];
+  private shakeT = 0;
+  private slab: THREE.Mesh | null = null;
+  /** §11 props: rail bars, pillars, umbrellas, trapdoors. */
+  private rails: { i: number; j: number; mesh: THREE.Mesh }[] = [];
+  private posts: THREE.Group[] = [];
+  private umbrellas: { slot: number; group: THREE.Group; canopy: THREE.Group; open: number }[] = [];
+  private doors: { group: THREE.Group; t: number }[] = [];
+  private winShown = -1;
   // the toy being knitted
   private toyScene = new THREE.Scene();
   private toyCam = new THREE.PerspectiveCamera(28, 1, 0.1, 100);
@@ -607,288 +586,342 @@ export class Scene3D {
     return c;
   }
 
-  holePos(h: number, y = 0): THREE.Vector3 {
-    const p = this.holeXY[h];
-    return new THREE.Vector3(p.x, y, p.z);
+  /** Slot s on the board (view space = board units, centred). */
+  holePos(s: number, y = 0): THREE.Vector3 {
+    const t = this.rules?.slots[s];
+    return new THREE.Vector3(t?.x ?? 0, y, t?.z ?? 0);
   }
-  /** Where pin k is drawn right now (the dragged one follows the finger). */
+  /** Where handle k is drawn (its base). */
   private pinPos(k: number): THREE.Vector3 {
-    if (this.drag && this.drag.k === k) return this.drag.p.clone();
-    return this.holePos(this.ends[k]);
+    const p = this.rules!.world.handles[k].pos;
+    return new THREE.Vector3(p[0], p[1] - END_Y, p[2]);
   }
 
   /**
-   * Build the board: `holes` (board units, y down), rope r between holes ends[2r] and ends[2r+1]
-   * stacked at its `layer`, `colors[r]` its colour (grey when hidden), the padlocked hole and the key rope.
+   * Build the board for these rules: `colors[r]` the colour of rope r (grey when hidden),
+   * `mystery[r]` a "?" over it until it is revealed.
    */
-  build(holes: [number, number][], ends: number[], ropes: { key?: boolean; layer: number }[], colors: string[], lock = -1, mystery: boolean[] = [], gone: boolean[] = [], rel?: Int8Array): void {
-    // centre the shape on the board
-    const xs = holes.map((h) => h[0]), ys = holes.map((h) => h[1]);
-    const cx = (Math.min(...xs) + Math.max(...xs)) / 2, cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-    this.holeXY = holes.map(([x, y]) => new THREE.Vector3(x - cx, 0, y - cy));
-    this.bounds = { x0: Math.min(...xs) - cx, x1: Math.max(...xs) - cx, z0: Math.min(...ys) - cy, z1: Math.max(...ys) - cy };
-    this.layers = ropes.map((r) => r.layer);
-    this.paths = [];
-    this.shift = { x: cx, y: cy };
-    this.rel = rel ? rel.slice() : new Int8Array(ropes.length * ropes.length);
-    this.ends = ends.slice();
+  build(rules: Board, colors: string[], mystery: boolean[] = []): void {
+    this.rules = rules;
+    this.ropeColors = colors.slice();
+    this.mysteryOf = mystery.slice();
+    const xs = rules.slots.map((s) => s.x), zs = rules.slots.map((s) => s.z);
+    this.bounds = { x0: Math.min(...xs), x1: Math.max(...xs), z0: Math.min(...zs), z1: Math.max(...zs) };
     this.board.clear();
     this.ropes = [];
-    this.lockFx = null;
-    this.drag = null;
-    this.selected = -1;
+    this.handles = [];
+    this.slotViews = [];
     Object.assign(this.zoom, { cur: 1, to: 1, px: 0, pz: 0, tx: 0, tz: 0 });
-    const S = Math.max(4, this.bounds.x1 - this.bounds.x0 + 1.6), D = Math.max(4, this.bounds.z1 - this.bounds.z0 + 1.6);
+    this.layoutSlab();
+    rules.handles.forEach((_, k) => this.addHandle(k));
+    this.decorate();
+    this.winShown = -1;
+    this.syncAll(0);
+  }
+  /** The board slab round the slots (rebuilt when Expansion adds a ring). */
+  private layoutSlab(): void {
+    const r = this.rules;
+    if (r && r.winRows < r.rows) {
+      // a long map: only the window's rows are the board on screen
+      const vis = r.slots.filter((s) => r.rowShown(s.row));
+      const xs = vis.map((s) => s.x), zs = vis.map((s) => s.z);
+      this.bounds = { x0: Math.min(...xs), x1: Math.max(...xs), z0: Math.min(...zs), z1: Math.max(...zs) };
+    }
+    const b = this.bounds;
+    const S = Math.max(4, b.x1 - b.x0 + 1.7), D = Math.max(4, b.z1 - b.z0 + 1.7);
+    // the camera looks at the middle of the board on screen (a long map: of its window)
+    this.target.set((b.x0 + b.x1) / 2, 0, (b.z0 + b.z1) / 2);
     this.zoom.w = S; this.zoom.d = D;
-    // a shadow box just round the board: crisp shadows where ropes lie on ropes
     const ext = Math.max(S, D) / 2 + 1.2;
     Object.assign(this.sun.shadow.camera, { left: -ext, right: ext, top: ext, bottom: -ext, near: 1, far: 40 });
     this.sun.shadow.camera.updateProjectionMatrix();
     this.sun.shadow.radius = 2.5;
-    // the cream board of the reference, a soft rounded slab
+    if (this.slab) { this.board.remove(this.slab); this.slab.geometry.dispose(); }
     const topMat = new THREE.MeshStandardMaterial({ color: 0xededf3, roughness: 0.85 });
     const sideMat = new THREE.MeshStandardMaterial({ color: 0xd4d4dc, roughness: 0.8 });
     const slab = new THREE.Mesh(new RoundedBoxGeometry(S, 0.34, D, 6, 0.24), [sideMat, sideMat, topMat, sideMat, sideMat, sideMat]);
-    slab.position.y = -0.17;
+    slab.position.set((b.x0 + b.x1) / 2, -0.17, (b.z0 + b.z1) / 2);
     slab.receiveShadow = true;
     slab.castShadow = true;
     this.board.add(slab);
-    // holes: a beige dish with a pale lip (they light up while a pin is carried)
-    this.holeMeshes = [];
-    const dish = new THREE.CircleGeometry(PIN_R * 1.24, 40), lipG = new THREE.RingGeometry(PIN_R * 1.24, PIN_R * 1.38, 40);
-    const lipMat = new THREE.MeshStandardMaterial({ color: 0xd2d2da, roughness: 0.85 });
-    for (let h = 0; h < holes.length; h++) {
-      const at = this.holePos(h);
-      const m = new THREE.Mesh(dish, new THREE.MeshStandardMaterial({ color: 0xdcdce2, roughness: 0.9, emissive: new THREE.Color(0x7cff6a), emissiveIntensity: 0 }));
-      m.rotation.x = -Math.PI / 2;
-      m.position.set(at.x, 0.004, at.z);
-      m.receiveShadow = true;
-      const lip = new THREE.Mesh(lipG, lipMat);
-      lip.rotation.x = -Math.PI / 2;
-      lip.position.set(at.x, 0.003, at.z);
-      this.board.add(m, lip);
-      this.holeMeshes.push(m);
-    }
-    colors.forEach((col, i) => {
-      const color = new THREE.Color(col);
-      const mat = ropeMaterial(color);
-      const group = new THREE.Group();
-      const pins = [0, 1].map(() => {
-        const p = pinMesh(color);
-        group.add(p.group);
-        return p;
-      }) as [PinMesh, PinMesh];
-      this.board.add(group);
-      const view: RopeView = { group, tube: null, line: null, hit: null, caps: [], mat, pins, color, mid: new THREE.Vector3(), segs: 1, anim: 0, shake: 0, flash: 0, glow: 0, dim: false, gone: !!gone[i], ball: null, bump: [0, 0] };
-      if (mystery[i]) {
-        const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.mysteryTex, depthTest: false }));
-        sp.scale.setScalar(0.42);
-        sp.renderOrder = 5;
-        group.add(sp);
-        view.mystery = sp;
-      }
-      if (view.gone) group.visible = false;
-      this.ropes.push(view);
-    });
-    // lock & key: a padlock over the locked pin, a key floating over the rope that opens it
-    if (lock >= 0) {
-      const { group: pad, shackle } = padlock();
-      const at = this.holePos(lock, PIN_H + 0.62);
-      pad.position.copy(at);
-      pad.scale.setScalar(1.7);
-      pad.rotation.x = -0.35;
-      this.board.add(pad);
-      let key: THREE.Group | null = null;
-      const ki = ropes.findIndex((t) => t.key);
-      if (ki >= 0) {
-        key = keyMesh();
-        key.scale.setScalar(1.7);
-        key.rotation.x = -0.6;
-        this.board.add(key);
-      }
-      const held = ropes.map((_, k) => k).filter((k) => ends[2 * k] === lock || ends[2 * k + 1] === lock);
-      for (const k of held) this.ropes[k].dim = true;
-      this.lockFx = { pad, shackle, key, keyRope: ki, keyHome: new THREE.Vector3(), at, t: 0, open: false, shake: 0, strands: held };
-    }
-    this.rebuild();
-    for (const k of this.lockFx?.strands ?? []) this.tint(k);
-    // what must be on screen: the board's rim
+    this.slab = slab;
     this.fit = [];
     this.frameOut = 0;
-    for (const x of [-S / 2, S / 2]) this.fit.push(new THREE.Vector3(x, 0, -D / 2), new THREE.Vector3(x, -0.34, D / 2));
-    if (lock >= 0) this.fit.push(this.holePos(lock, PIN_H + 1.1));
-    this.target.set(0, 0, 0);
+    for (const x of [b.x0 - S / 2 + (b.x1 - b.x0) / 2, b.x1 + S / 2 - (b.x1 - b.x0) / 2]) this.fit.push(new THREE.Vector3(x, 0, (b.z0 + b.z1) / 2 - D / 2), new THREE.Vector3(x, -0.34, (b.z0 + b.z1) / 2 + D / 2));
+  }
+  private addSlot(i: number): void {
+    const s = this.rules!.slots[i];
+    const mat = new THREE.MeshStandardMaterial({ color: 0xdcdce2, roughness: 0.9, transparent: true, emissive: new THREE.Color(0x7cff6a), emissiveIntensity: 0 });
+    const dish = new THREE.Mesh(new THREE.CircleGeometry(PIN_R * 1.24, 40), mat);
+    dish.rotation.x = -Math.PI / 2;
+    dish.position.set(s.x, 0.004, s.z);
+    dish.receiveShadow = true;
+    const lip = new THREE.Mesh(new THREE.RingGeometry(PIN_R * 1.24, PIN_R * 1.38, 40), new THREE.MeshStandardMaterial({ color: 0xd2d2da, roughness: 0.85 }));
+    lip.rotation.x = -Math.PI / 2;
+    lip.position.set(s.x, 0.003, s.z);
+    // the selection ring of the active slot
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(PIN_R * 1.45, 0.05, 10, 48), new THREE.MeshBasicMaterial({ color: 0x3fd16a }));
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(s.x, 0.03, s.z);
+    ring.visible = false;
+    // a forbidden slot: a red cross
+    const cross = new THREE.Group();
+    const xm = new THREE.MeshStandardMaterial({ color: 0xe8443b, roughness: 0.5 });
+    for (const a of [Math.PI / 4, -Math.PI / 4]) {
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(PIN_R * 1.5, 0.05, 0.1), xm);
+      bar.rotation.y = a;
+      cross.add(bar);
+    }
+    cross.position.set(s.x, 0.03, s.z);
+    this.board.add(dish, lip, ring, cross);
+    this.slotViews[i] = { dish, mat, lip, ring, cross, kind: '' };
+    if (!s.exists) { dish.visible = lip.visible = cross.visible = false; }
+  }
+  private addHandle(k: number): void {
+    const r = this.rules!, h = r.handles[k];
+    const rope = h.ropes[0] ?? 0;
+    const color = new THREE.Color(this.ropeColors[rope] ?? '#888888');
+    const pin = pinMesh(color);
+    // a fixed handle: a steel nail through its middle
+    const nail = new THREE.Group();
+    const steel = new THREE.MeshStandardMaterial({ color: 0xc9ccd6, roughness: 0.25, metalness: 0.8 });
+    const head = new THREE.Mesh(new THREE.CylinderGeometry(PIN_R * 0.42, PIN_R * 0.42, 0.06, 24), steel);
+    head.position.y = PIN_H + 0.1;
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(PIN_R * 0.12, PIN_R * 0.12, 0.12, 12), steel);
+    shaft.position.y = PIN_H + 0.04;
+    nail.add(head, shaft);
+    // a converted handle: a ring in the colour of its moves left
+    const ringMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.35, emissive: new THREE.Color(0x000000) });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(PIN_R * 0.95, 0.07, 10, 40), ringMat);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = PIN_H * 0.6;
+    pin.group.add(nail, ring);
+    // a multi-slot handle: a button on every cell it covers, joined by bars
+    const offs = h.cells.map(([dr, dc]) => new THREE.Vector3(dc * r.pitchX, 0, dr * 1.3143));
+    for (let c = 1; c < offs.length; c++) {
+      const extra = pinMesh(color);
+      extra.group.position.copy(offs[c]);
+      pin.group.add(extra.group);
+    }
+    for (let a = 0; a < offs.length; a++) for (let b = a + 1; b < offs.length; b++) {
+      const d = offs[a].distanceTo(offs[b]);
+      if (d > Math.max(r.pitchX, 1.3143) * 1.05) continue;
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(d, PIN_H * 0.7, PIN_R * 0.9), new THREE.MeshPhysicalMaterial({ color, roughness: 0.32, clearcoat: 0.6 }));
+      bar.position.copy(offs[a]).add(offs[b]).multiplyScalar(0.5).setY(PIN_H * 0.35);
+      bar.rotation.y = -Math.atan2(offs[b].z - offs[a].z, offs[b].x - offs[a].x);
+      bar.castShadow = true;
+      pin.group.add(bar);
+    }
+    // a geared handle: a little golden cog on top
+    let cog: THREE.Group | null = null;
+    if (h.gear) {
+      cog = new THREE.Group();
+      const gold = new THREE.MeshStandardMaterial({ color: h.gear === 1 ? 0xf2b23a : 0x9fd1ff, roughness: 0.3, metalness: 0.6 });
+      cog.add(new THREE.Mesh(new THREE.TorusGeometry(PIN_R * 0.42, 0.06, 8, 24), gold));
+      for (let t = 0; t < 8; t++) { const tooth = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 0.1), gold); const a = (t / 8) * Math.PI * 2; tooth.position.set(Math.cos(a) * PIN_R * 0.55, Math.sin(a) * PIN_R * 0.55, 0); cog.add(tooth); }
+      cog.rotation.x = -Math.PI / 2;
+      cog.position.y = PIN_H + 0.06;
+      pin.group.add(cog);
+    }
+    // time to fixed: a ring that runs down
+    let timer: THREE.Mesh | null = null;
+    if (h.toFixedTime !== null) {
+      timer = new THREE.Mesh(new THREE.RingGeometry(PIN_R * 1.05, PIN_R * 1.25, 40, 1, 0, Math.PI * 2), new THREE.MeshBasicMaterial({ color: 0xffb020, side: THREE.DoubleSide }));
+      timer.rotation.x = -Math.PI / 2;
+      timer.position.y = 0.03;
+      pin.group.add(timer);
+    }
+    this.board.add(pin.group);
+    this.handles[k] = { pin, nail, ring, ringMat, bump: 0, color, cog, timer, timerAt: 1 };
   }
 
-  /**
-   * Lay every rope as the rules say (`rel`): paths first (straight, or bent round hooks),
-   * then heights — a few passes, each rope on top lifted over what it lies on there —
-   * then the tubes (`fast` = coarse, while a pin is carried).
-   */
-  private rebuild(fast = false): void {
-    const n = this.ropes.length;
-    const rel = this.rel.slice();
-    const d = this.drag;
-    if (d && this.dragRule) {
-      const row = this.dragRule(d.k, [d.p.x + this.shift.x, d.p.z + this.shift.y]);
-      const i = d.k >> 1, M = [NONE, UNDER, OVER, WRAPPED, WRAP];
-      for (let j = 0; j < n; j++) if (j !== i) { rel[i * n + j] = row[j]; rel[j * n + i] = M[row[j]]; }
+  /** The §11 props round the slots: rails, pillars, umbrellas, trapdoors. */
+  private decorate(): void {
+    const r = this.rules!;
+    this.rails = []; this.posts = []; this.umbrellas = []; this.doors = [];
+    const steel = new THREE.MeshStandardMaterial({ color: 0x7a8396, roughness: 0.35, metalness: 0.7 });
+    const reach = Math.max(r.pitchX, 1.3143) * 1.05;
+    r.slots.forEach((a, i) => r.slots.forEach((b, j) => {
+      if (j <= i || a.rail === null || a.rail !== b.rail) return;
+      const d = Math.hypot(b.x - a.x, b.z - a.z);
+      if (d > reach) return;
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(d, 0.05, 0.2), steel);
+      mesh.position.set((a.x + b.x) / 2, 0.03, (a.z + b.z) / 2);
+      mesh.rotation.y = -Math.atan2(b.z - a.z, b.x - a.x);
+      mesh.receiveShadow = true;
+      this.board.add(mesh);
+      this.rails.push({ i, j, mesh });
+    }));
+    const wood = new THREE.MeshStandardMaterial({ color: 0xb98256, roughness: 0.6 });
+    for (const p of r.world.pillars) {
+      const g = new THREE.Group();
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(PILLAR_R * 0.9, PILLAR_R, 0.95, 20), wood);
+      post.position.y = 0.475;
+      const cap = new THREE.Mesh(new THREE.SphereGeometry(PILLAR_R * 1.05, 20, 12), new THREE.MeshStandardMaterial({ color: 0xe8443b, roughness: 0.4 }));
+      cap.position.y = 0.97;
+      post.castShadow = cap.castShadow = true;
+      g.add(post, cap);
+      g.position.set(p.x, 0, p.z);
+      this.board.add(g);
+      this.posts.push(g);
     }
-    const R2 = (i: number, j: number) => rel[i * n + j];
-    const live = (i: number) => !(this.ropes[i].gone && this.ropes[i].anim >= 1);
-    const chord = (i: number) => { const a = this.pinPos(2 * i), b = this.pinPos(2 * i + 1); return { a, b }; };
-    // 1. paths: pin → (hooks, in order along the rope) → pin
-    const hookAt: { i: number; j: number; x: number; z: number }[] = [];
-    for (let i = 0; i < n; i++) {
-      if (!live(i)) { this.paths[i] = null; continue; }
-      const { a, b } = chord(i);
-      const ya = H0 + a.y, yb = H0 + b.y;
-      const pts: Ctrl[] = [{ x: a.x, z: a.z, y: ya }];
-      const hooks: { j: number; x: number; z: number; u: number }[] = [];
-      if (!this.ropes[i].gone) for (let j = 0; j < n; j++) {
-        if (j === i || !live(j) || this.ropes[j].gone || R2(i, j) !== WRAP) continue;
-        // the hook sits where the rope is shortest: the point P on j minimising |a-P| + |P-b|
-        const c = chord(j);
-        const at = (t: number) => [c.a.x + (c.b.x - c.a.x) * t, c.a.z + (c.b.z - c.a.z) * t];
-        const f = (t: number) => { const [x, z] = at(t); return Math.hypot(x - a.x, z - a.z) + Math.hypot(x - b.x, z - b.z); };
-        let lo = 0.08, hi = 0.92;
-        for (let q = 0; q < 40; q++) { const m1 = lo + (hi - lo) / 3, m2 = hi - (hi - lo) / 3; if (f(m1) < f(m2)) hi = m2; else lo = m1; }
-        const [x, z] = at((lo + hi) / 2);
-        const L = Math.hypot(b.x - a.x, b.z - a.z) || 1;
-        hooks.push({ j, x, z, u: ((x - a.x) * (b.x - a.x) + (z - a.z) * (b.z - a.z)) / (L * L) });
+    r.slots.forEach((s, i) => {
+      if (!s.umbrella) return;
+      const g = new THREE.Group();
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 1.25, 8), new THREE.MeshStandardMaterial({ color: 0x5b3a22, roughness: 0.6 }));
+      pole.position.y = 0.62;
+      const canopy = new THREE.Group();
+      for (let t = 0; t < 8; t++) {
+        const panel = new THREE.Mesh(new THREE.ConeGeometry(1, 0.4, 2, 1, true, (t / 8) * Math.PI * 2, Math.PI / 4), new THREE.MeshStandardMaterial({ color: t % 2 ? 0xffffff : 0xff5a6e, roughness: 0.5, side: THREE.DoubleSide }));
+        canopy.add(panel);
       }
-      hooks.sort((p, q) => p.u - q.u);
-      const zones: [number, number][] = [];
-      for (const hk of hooks) {
-        const c = chord(hk.j);
-        let tx = c.b.x - c.a.x, tz = c.b.z - c.a.z;
-        const tl = Math.hypot(tx, tz) || 1;
-        tx /= tl; tz /= tl;
-        // n: towards the side the rope comes from; t: so the rope meets the hook from -t
-        let nx = -tz, nz = tx;
-        const mx = (a.x + b.x) / 2 - hk.x, mz = (a.z + b.z) / 2 - hk.z;
-        if (nx * mx + nz * mz < 0) { nx = -nx; nz = -nz; }
-        if ((a.x - hk.x) * tx + (a.z - hk.z) * tz > 0) { tx = -tx; tz = -tz; }
-        const S = 0.15, D = 0.26, P = (u: number, v: number, y: number): Ctrl => ({ x: hk.x + nx * u + tx * v, z: hk.z + nz * u + tz * v, y });
-        // in from the near side, under j, up behind it, over the top, back out on the near side
-        pts.push(P(D, -S, H0), P(-0.2, -S, H0), P(-0.24, 0, H0 + STACK * 0.95), P(0, S, H0 + STACK * 2.1), P(D, S, H0 + STACK * 0.6));
-        hookAt.push({ i, j: hk.j, x: hk.x, z: hk.z });
-        zones.push([pts.length - 5, pts.length - 1]);
-      }
-      pts.push({ x: b.x, z: b.z, y: yb });
-      const path = new RopePath(pts);
-      path.zones = zones.map(([k0, k1]) => [path.cum[k0] - 0.05, path.cum[k1] + 0.05]);
-      this.paths[i] = path;
-    }
-    // a rope something is hooked round is lifted a little there, so the hook can pass under it
-    for (const h of hookAt) {
-      const pj = this.paths[h.j];
-      if (pj) pj.hookBumps.push({ sc: pj.nearest(h.x, h.z), peak: H0 + STACK, half: 0.18, ramp: 0.3 });
-    }
-    // 2. heights: who lies on whom where they cross (the rules; layers only where the rules have no say)
-    const pairs: { top: number; bot: number; s: number; t: number; sin: number }[] = [];
-    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
-      const pi = this.paths[i], pj = this.paths[j];
-      if (!pi || !pj || this.ropes[i].gone || this.ropes[j].gone) continue;
-      const r = R2(i, j);
-      if (r === WRAP || r === WRAPPED) continue;   // the hook draws itself
-      const iTop = r === OVER ? true : r === UNDER ? false : this.layers[i] > this.layers[j];
-      for (const x of crossings(pi, pj)) pairs.push(iTop ? { top: i, bot: j, s: x.s, t: x.t, sin: x.sin } : { top: j, bot: i, s: x.t, t: x.s, sin: x.sin });
-    }
-    // the one underneath is pressed into the board a touch and shaded where the other lies on it
-    for (const c of pairs) this.paths[c.bot]!.dips.push({ sc: c.t, peak: 0.035, half: (R * 0.9) / Math.max(0.1, c.sin), ramp: 0.28 });
-    // the one on top drapes over it: flat only while the two touch, then down to the board; piles of 3–4 settle over a few passes
-    for (let pass = 0; pass < 4; pass++) {
-      const next: Bump[][] = this.paths.map(() => []);
-      for (const c of pairs) {
-        const top = this.paths[c.top]!, bot = this.paths[c.bot]!;
-        void top;
-        const peak = Math.min(H0 + STACK * 4, bot.heightAt(c.t) + STACK);
-        next[c.top].push({ sc: c.s, peak, half: Math.min(1.2, (R * 1.15) / Math.max(0.08, c.sin)), ramp: 0.26 + (peak - H0) * 1.6 });
-      }
-      this.paths.forEach((p, k) => { if (p) p.bumps = next[k]; });
-    }
-    // 3. tubes
-    for (let i = 0; i < n; i++) this.layRope(i, fast);
-    this.placeExtras();
-  }
-  private layRope(i: number, fast: boolean): void {
-    const v = this.ropes[i], path = this.paths[i];
-    if (!path) return;
-    const curve = path.curve(fast ? 0.16 : 0.08);
-    const len = curve.getLength();
-    const segs = Math.max(16, Math.round(len * (fast ? 14 : 28)));
-    for (const m of [v.tube, v.line, v.hit]) if (m) { m.geometry.dispose(); v.group.remove(m); }
-    v.tube = new THREE.Mesh(ropeGeometry(curve, segs, R, false, len, 0.07, 0.8, path.dips.length ? (u) => path.shadeAt(u * path.len) : undefined), v.mat);
-    v.tube.castShadow = true;
-    v.tube.receiveShadow = true;
-    // the dark outline of the reference: a slightly fatter tube, back faces only
-    v.line = new THREE.Mesh(new THREE.TubeGeometry(curve, segs, R * 1.2, LINE_RADIAL, false), LINE_MAT);
-    const a = path.pts[0], b = path.pts[path.pts.length - 1];
-    v.hit = new THREE.Mesh(new THREE.TubeGeometry(new THREE.LineCurve3(new THREE.Vector3(a.x, H0, a.z), new THREE.Vector3(b.x, H0, b.z)), 4, 0.3, 6, false), HIT_MAT);
-    v.hit.userData.strand = i;
-    v.caps = [];
-    v.group.add(v.tube, v.line, v.hit);
-    v.segs = segs;
-    v.mid = curve.getPointAt(0.5);
-    if (v.gone) { v.tube.geometry.setDrawRange(0, 0); v.line.geometry.setDrawRange(0, 0); }
-  }
-  /** Pins, the "?" badges and the key follow the ropes. */
-  private placeExtras(): void {
-    this.ropes.forEach((v, i) => {
-      for (const e of [0, 1]) {
-        const p = this.pinPos(2 * i + e);
-        v.pins[e].group.position.copy(p);
-      }
-      if (v.mystery) v.mystery.position.copy(v.mid).add(new THREE.Vector3(0, 0.32, 0));
+      canopy.position.y = 1.3;
+      g.add(pole, canopy);
+      g.position.set(s.x, 0, s.z);
+      g.traverse((o) => { o.castShadow = true; });
+      this.board.add(g);
+      this.umbrellas.push({ slot: i, group: g, canopy, open: s.umbrella.isOpen ? 1 : 0 });
     });
-    const f = this.lockFx;
-    if (f?.key && f.keyRope >= 0 && !f.open) f.keyHome.copy(this.ropes[f.keyRope].mid).add(new THREE.Vector3(0, 0.45, 0));
+    r.traps.forEach((t) => {
+      const xs = t.slots.map((q) => r.slots[q].x), zs = t.slots.map((q) => r.slots[q].z);
+      const w = Math.max(...xs) - Math.min(...xs) + r.pitchX * 0.9, d = Math.max(...zs) - Math.min(...zs) + 1.3143 * 0.9;
+      const g = new THREE.Group();
+      const door = new THREE.Mesh(new RoundedBoxGeometry(w, 0.14, d, 4, 0.08), new THREE.MeshStandardMaterial({ color: 0x9a6a3e, roughness: 0.7 }));
+      door.position.y = 0.08;
+      door.receiveShadow = door.castShadow = true;
+      g.add(door);
+      // planks and two chains across
+      for (let p = 1; p < 4; p++) { const line = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.02, d * 0.94), new THREE.MeshStandardMaterial({ color: 0x6b4526 })); line.position.set(-w / 2 + (w * p) / 4, 0.16, 0); g.add(line); }
+      const iron = new THREE.MeshStandardMaterial({ color: 0x8b8f99, metalness: 0.7, roughness: 0.35 });
+      for (const z of [-d / 4, d / 4]) for (let c = 0; c < 9; c++) { const link = new THREE.Mesh(new THREE.TorusGeometry(0.07, 0.022, 6, 12), iron); link.position.set(-w / 2 + 0.1 + (c / 8) * (w - 0.2), 0.19, z); link.rotation.y = c % 2 ? Math.PI / 2 : 0; g.add(link); }
+      g.position.set((Math.min(...xs) + Math.max(...xs)) / 2, 0, (Math.min(...zs) + Math.max(...zs)) / 2);
+      this.board.add(g);
+      this.doors.push({ group: g, t: 0 });
+    });
+  }
+  private addRope(w: number): void {
+    const r = this.rules!, wr = r.world.ropes[w];
+    const owner = r.owner[w] ?? w;
+    const color = new THREE.Color(this.ropeColors[owner] ?? '#888888');
+    const mat = ropeMaterial(color);
+    const segs = Math.max(12, (wr.n - 1) * 2);
+    const buf = new TubeBuf(segs, RADIAL, R, 0.07), lbuf = new TubeBuf(segs, LINE_RADIAL, R * 1.12, 0);
+    const tube = new THREE.Mesh(buf.geo, mat), line = new THREE.Mesh(lbuf.geo, LINE_MAT);
+    tube.castShadow = true;
+    tube.receiveShadow = true;
+    tube.frustumCulled = false;
+    line.frustumCulled = false;
+    const group = new THREE.Group();
+    group.add(tube, line);
+    this.board.add(group);
+    const v: RopeView = { group, tube, line, buf, lbuf, mat, color, mid: new THREE.Vector3(), segs, n: wr.n, anim: 0, flash: 0, glow: 0, gone: false, ball: null, owner, shown: '' };
+    if (this.mysteryOf[owner] && w === owner) {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.mysteryTex, depthTest: false }));
+      sp.scale.setScalar(0.42);
+      sp.renderOrder = 5;
+      group.add(sp);
+      v.mystery = sp;
+    }
+    this.ropes[w] = v;
   }
 
-  /** New pin places from the rules; `glide` = pin k slides in from where it is drawn now. */
-  setEnds(ends: number[], gone: boolean[], rel?: Int8Array): void {
-    this.ends = ends.slice();
-    if (rel) this.rel = rel.slice();
-    gone.forEach((g, i) => { if (g && !this.ropes[i].gone) this.setGone(i, true); });
-    if (!this.drag) this.rebuild();
+  /** Everything follows the rules: slots, handles, ropes. */
+  private synced = -1;
+  private syncAll(dt: number): void {
+    const r = this.rules;
+    if (!r) return;
+    // slots (Expansion may add or take some away)
+    for (let i = 0; i < r.slots.length; i++) if (!this.slotViews[i]) this.addSlot(i);
+    while (this.slotViews.length > r.slots.length) { const v = this.slotViews.pop()!; this.board.remove(v.dish, v.lip, v.ring, v.cross); }
+    if (this.slotViews.length && (r.slots.length !== this.slotCount)) {
+      this.slotCount = r.slots.length;
+      const xs = r.slots.map((s) => s.x), zs = r.slots.map((s) => s.z);
+      this.bounds = { x0: Math.min(...xs), x1: Math.max(...xs), z0: Math.min(...zs), z1: Math.max(...zs) };
+      this.layoutSlab();
+    }
+    // a long map: when the window slides, the board on screen follows it
+    if (r.winRows < r.rows && this.winShown !== r.winMin) { this.winShown = r.winMin; this.layoutSlab(); }
+    r.slots.forEach((s, i) => {
+      const v = this.slotViews[i];
+      const shown = r.rowShown(s.row);
+      v.dish.visible = v.lip.visible = s.exists && shown;
+      if (!shown) { v.ring.visible = v.cross.visible = false; v.kind = 'hidden'; return; }
+      const kind = !s.exists ? 'none' : s.type + (s.state === 'active' ? '+' : '') + (s.covered ? 'c' : '');
+      if (kind === v.kind) return;
+      v.kind = kind;
+      v.ring.visible = s.state === 'active';
+      v.cross.visible = s.exists && s.type === 'forbidden';
+      v.mat.color.set(s.type === 'forbidden' ? 0xc9c6cf : s.covered ? 0xb3c2dc : 0xdcdce2);
+      v.mat.opacity = s.type === 'preview' ? 0.45 : 1;
+      (v.lip.material as THREE.MeshStandardMaterial).transparent = s.type === 'preview';
+      (v.lip.material as THREE.MeshStandardMaterial).opacity = s.type === 'preview' ? 0.45 : 1;
+    });
+    // handles
+    r.handles.forEach((h, k) => {
+      const v = this.handles[k];
+      if (!v) return;
+      const g = v.pin.group;
+      const cells = r.cellsAt(k, h.slot) ?? [h.slot];
+      g.visible = !h.gone && !h.dormant && cells.every((q) => r.rowShown(r.slots[q].row));
+      if (!g.visible) return;
+      if (v.cog) v.cog.rotation.z += h.state === 'stable' ? 0 : dt * 6;
+      if (v.timer && h.toFixedTime !== null) {
+        const f = Math.max(0, 1 - r.elapsed / h.toFixedTime);
+        if (Math.abs(f - v.timerAt) > 0.01) { v.timerAt = f; v.timer.geometry.dispose(); v.timer.geometry = new THREE.RingGeometry(PIN_R * 1.05, PIN_R * 1.25, 40, 1, Math.PI / 2, Math.PI * 2 * f); (v.timer.material as THREE.MeshBasicMaterial).color.set(f < 0.25 ? 0xff4a3a : 0xffb020); }
+      } else if (v.timer) v.timer.visible = false;
+      g.position.copy(this.pinPos(k));
+      if (v.bump > 0) v.bump = Math.max(0, v.bump - dt * 3);
+      const sq = Math.sin(v.bump * Math.PI * 2) * v.bump * 0.25;
+      g.scale.set(h.scale * (1 + sq), h.scale * (1 - sq), h.scale * (1 + sq));
+      v.nail.visible = h.fixed && h.converted === null;
+      v.ring.visible = h.converted !== null;
+      if (h.converted !== null) v.ringMat.color.set(CFG.convertedColors[Math.max(0, Math.min(3, h.converted - 1))]);
+    });
+    // the §11 props
+    for (const rl of this.rails) rl.mesh.visible = r.slots[rl.i].rail !== null && r.slots[rl.i].rail === r.slots[rl.j].rail && r.rowShown(r.slots[rl.i].row);
+    r.world.pillars.forEach((p, i) => { const g = this.posts[i]; if (!g) return; const k = p.gone ? Math.max(0, g.scale.y - dt * 5) : 1; g.scale.set(1, Math.max(0.001, k), 1); g.visible = k > 0.01; });
+    for (const u of this.umbrellas) {
+      const st = r.slots[u.slot].umbrella!;
+      u.group.visible = !st.gone && r.rowShown(r.slots[u.slot].row);
+      u.open += ((st.isOpen ? 1 : 0) - u.open) * Math.min(1, dt * 6);
+      u.canopy.scale.set(0.25 + 0.75 * u.open, 1 + (1 - u.open) * 1.2, 0.25 + 0.75 * u.open);
+    }
+    r.traps.forEach((t, i) => {
+      const dv = this.doors[i];
+      if (!dv) return;
+      if (t.state === 'closed') { dv.group.visible = true; return; }
+      dv.t = Math.min(1, dv.t + dt / 0.5);
+      dv.group.position.y = -dv.t * 0.4;
+      dv.group.scale.setScalar(Math.max(0.001, 1 - dv.t * 0.3));
+      dv.group.visible = t.state !== 'open' || dv.t < 1;
+    });
+    // ropes (redrawn only when the physics moved)
+    for (let w = 0; w < r.world.ropes.length; w++) if (!this.ropes[w]) this.addRope(w);
+    const moved = this.synced !== r.world.steps;
+    this.synced = r.world.steps;
+    r.world.ropes.forEach((wr, w) => {
+      const v = this.ropes[w];
+      if (v.gone && v.anim >= 1) return;
+      v.group.visible = !wr.gone || (v.gone && v.anim < 1 && !!v.ball);
+      if (wr.gone) { v.tube.visible = v.line.visible = false; return; }
+      const ends = wr.h.filter((q) => q >= 0);
+      const shown = ends.length === 0 || ends.some((q) => this.handles[q]?.pin.group.visible);
+      v.tube.visible = v.line.visible = shown;
+      if (!shown) return;
+      if (moved || dt === 0) { v.buf.update(wr.x, wr.n, 0, 0); v.lbuf.update(wr.x, wr.n, 0, 0); v.buf.mid(v.mid); }
+      if (v.mystery) v.mystery.position.copy(v.mid).add(new THREE.Vector3(0, 0.32, 0));
+      // stretched past the warning rate: orange → red (as the rules measure it)
+      const warn = r.warn[v.owner] ?? -1, key = this.ropeColors[v.owner] + ':' + warn.toFixed(2);
+      if (key !== v.shown) {
+        v.shown = key;
+        const c = ropeColor(new THREE.Color(this.ropeColors[v.owner]));
+        if (warn >= 0) c.copy(WARN).lerp(SNAP, warn);
+        v.mat.color.copy(c);
+      }
+    });
   }
+  private slotCount = 0;
 
-  // ------------------------------------------------------------ dragging a pin
-
-  /** Start carrying pin k: it lifts a little; its rope keeps its layer (under the ones above it, over the ones below). */
-  beginDrag(k: number): void {
-    const p = this.holePos(this.ends[k]);
-    this.drag = { k, p: p.clone(), to: null, t: 0, from: p.clone(), done: null };
-    this.selected = -1;
-    this.dragAt.set(1e9, 0, 0);
-  }
-  /** Carry the pin to the page point. */
-  dragTo(x: number, y: number): void {
-    const d = this.drag;
-    if (!d || d.to) return;
-    const q = this.boardPoint(x, y, LIFT);
-    if (!q) return;
-    const B = this.bounds;
-    d.p.set(Math.max(B.x0 - 0.4, Math.min(B.x1 + 0.4, q.x)), LIFT, Math.max(B.z0 - 0.4, Math.min(B.z1 + 0.4, q.z)));
-  }
-  /** Let go: the pin glides into hole `h` (the rules already put it there) and the ropes settle. */
-  endDrag(h: number, ends: number[], dur = 0.13, rel?: Int8Array): Promise<void> {
-    const d = this.drag;
-    if (!d) return Promise.resolve();
-    this.ends = ends.slice();
-    if (rel) this.rel = rel.slice();
-    d.from = d.p.clone();
-    d.to = this.holePos(h);
-    d.t = 0;
-    d.dur = dur;
-    return new Promise((res) => { d.done = res; });
-  }
-  get dragging(): number { return this.drag?.k ?? -1; }
-  /** How the carried rope would lie (from the rules), asked as the pin moves. */
-  setDragRule(f: (k: number, p: [number, number]) => Int8Array): void { this.dragRule = f; }
-  /** Tap mode: pin k bobs up, waiting for a hole (-1 = none). */
-  select(k: number): void { this.selected = k; }
   /** The board point under a page point, on the plane at height y. */
   boardPoint(x: number, y: number, h = 0): THREE.Vector3 | null {
     const nx = ((x - this.view.x) / this.view.w) * 2 - 1;
@@ -896,100 +929,64 @@ export class Scene3D {
     this.ray.setFromCamera(new THREE.Vector2(nx, ny), this.camera);
     return this.ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), -h), new THREE.Vector3());
   }
-  /** The pin (rope*2 + end) under the page point, or -1. */
+  /** The handle under the page point (enlarged touch area), or -1. */
   pickPin(x: number, y: number): number {
     let best = -1, bd = Infinity;
-    const lim = Math.max(24, this.pinPx() * 1.25);
-    this.ropes.forEach((v, i) => {
-      if (v.gone) return;
-      for (const e of [0, 1]) {
-        const q = this.toScreen(this.holePos(this.ends[2 * i + e], PIN_H));
-        const dd = Math.hypot(q.x - x, q.y - y);
-        if (dd < lim && dd < bd) { bd = dd; best = 2 * i + e; }
-      }
+    const lim = Math.max(26, this.pinPx() * 1.35);
+    this.rules?.handles.forEach((h, k) => {
+      if (h.gone) return;
+      const q = this.toScreen(this.pinPos(k).add(new THREE.Vector3(0, PIN_H, 0)));
+      const dd = Math.hypot(q.x - x, q.y - y);
+      if (dd < lim && dd < bd) { bd = dd; best = k; }
     });
     return best;
   }
-  /** The hole nearest the page point (within reach), or -1. */
+  /** The slot nearest the page point (within reach), or -1. */
   pickHole(x: number, y: number, reach = 1.6): number {
     let best = -1, bd = Infinity;
     const lim = Math.max(28, this.pinPx() * reach);
-    for (let h = 0; h < this.holeXY.length; h++) {
-      const q = this.toScreen(this.holePos(h));
+    this.rules?.slots.forEach((s, i) => {
+      if (!s.exists) return;
+      const q = this.toScreen(new THREE.Vector3(s.x, 0, s.z));
       const dd = Math.hypot(q.x - x, q.y - y);
-      if (dd < lim && dd < bd) { bd = dd; best = h; }
-    }
+      if (dd < lim && dd < bd) { bd = dd; best = i; }
+    });
     return best;
   }
-  /** A hole's place on the page (css px). */
-  holeScreen(h: number, y = 0): { x: number; y: number } { return this.toScreen(this.holePos(h, y)); }
+  /** A slot's place on the page (css px). */
+  holeScreen(s: number, y = 0): { x: number; y: number } { return this.toScreen(this.holePos(s, y)); }
+  /** A handle's place on the page (css px). */
+  pinScreen(k: number): { x: number; y: number } { return this.toScreen(this.pinPos(k).add(new THREE.Vector3(0, PIN_H, 0))); }
   /** Pin radius on screen (css px). */
   pinPx(): number {
     const a = this.toScreen(new THREE.Vector3(0, PIN_H, 0)), b = this.toScreen(new THREE.Vector3(PIN_R, PIN_H, 0));
     return Math.abs(b.x - a.x);
   }
-  /** Empty holes glow while a pin is carried. */
-  setEmptyHoles(empty: number[]): void { this.emptyNow = new Set(empty); }
-
-  private tint(i: number): void {
-    const v = this.ropes[i];
-    const c = ropeColor(v.color).multiplyScalar(v.dim ? DIM : 1);
-    v.mat.color.copy(c);
-    for (const p of v.pins) { p.body.color.copy(v.color).multiplyScalar(v.dim ? DIM : 1); p.top.color.copy(v.color).multiplyScalar(0.78 * (v.dim ? DIM : 1)); p.rim.color.copy(ropeColor(v.color)).multiplyScalar(0.35); }
-  }
   setColor(i: number, color: string): void {
-    const v = this.ropes[i];
-    if (!v) return;
-    v.color.set(color);
-    this.tint(i);
-    if (v.mystery) v.mystery.visible = false;
+    this.ropeColors[i] = color;
+    this.handles.forEach((v, k) => { if (this.rules!.handles[k].ropes[0] === i) { v.color.set(color); v.pin.body.color.set(color); v.pin.top.color.set(color).multiplyScalar(0.78); v.pin.rim.color.copy(ropeColor(new THREE.Color(color))).multiplyScalar(0.35); } });
+    this.ropes.forEach((v) => { if (v && v.owner === i && v.mystery) v.mystery.visible = false; });
   }
-  /** The key has come off: fly it into the padlock and open it (or, `now`, just show it open / closed). */
-  setUnlocked(open: boolean, now = false): void {
-    const f = this.lockFx;
-    if (!f) return;
-    f.open = open;
-    f.t = open && !now ? 0 : open ? 2 : 0;
-    if (!open || now) this.placeLock();
-    if (open && now) for (const k of f.strands) { this.ropes[k].dim = false; this.tint(k); }
-    if (!open) for (const k of f.strands) { this.ropes[k].dim = true; this.tint(k); }
-  }
-  private placeLock(): void {
-    const f = this.lockFx!;
-    const done = f.open && f.t >= 2;
-    f.pad.visible = !done;
-    f.pad.position.copy(f.at); f.pad.scale.setScalar(1.7); f.pad.rotation.set(-0.35, 0, 0);
-    f.shackle.position.y = 0.16;
-    if (f.key) { f.key.visible = !f.open; f.key.position.copy(f.keyHome); f.key.scale.setScalar(1.7); }
-  }
-  shakeLock(): void { if (this.lockFx) this.lockFx.shake = 1; }
   /** A white pulse on rope i ("this is the one you need"). */
-  glow(i: number): void { const v = this.ropes[i]; if (v) v.glow = 1; }
-  lockPoint(): THREE.Vector3 | null { return this.lockFx ? this.lockFx.at.clone() : null; }
-  /** Pull rope i off (animated) or put it back (undo). */
-  setGone(i: number, gone: boolean): void {
-    const v = this.ropes[i];
-    if (!v) return;
-    v.gone = gone;
-    if (!gone) {
-      v.anim = 0; v.group.visible = true; v.group.position.set(0, 0, 0);
-      v.tube?.geometry.setDrawRange(0, Infinity);
-      v.line?.geometry.setDrawRange(0, Infinity);
-      for (const p of v.pins) p.group.scale.setScalar(1);
-      if (v.ball) v.ball.visible = false;
-    } else if (!v.ball) {
-      v.ball = ropeBall(v.color);
-      v.ball.visible = false;
-      this.board.add(v.ball);
-    }
+  glow(i: number): void { const v = this.viewOf(i); if (v) v.glow = 1; }
+  flash(i: number): void { const v = this.viewOf(i); if (v) v.flash = 1; }
+  setHighlight(i: number, a: number): void { const v = this.viewOf(i); if (v && !v.flash && !v.glow) { v.mat.emissive.set(0x9cff7a); v.mat.emissiveIntensity = a; } }
+  private viewOf(i: number): RopeView | undefined { const w = this.rules?.ropes[i]?.w; return w === undefined ? undefined : this.ropes[w]; }
+  midOf(i: number): THREE.Vector3 { return this.viewOf(i)?.mid.clone() ?? new THREE.Vector3(); }
+  /** Rope i has come off: a wound ball rises where it was (the 2D ball then flies to the trays). */
+  setGone(i: number): void {
+    const v = this.viewOf(i);
+    if (!v || v.gone) return;
+    v.gone = true;
+    v.anim = 0;
+    v.ball = ropeBall(v.color);
+    v.ball.position.copy(v.mid);
+    this.board.add(v.ball);
   }
-  /** A pin bounces (it has just landed, or it can't move). */
-  bumpPin(k: number): void { const v = this.ropes[k >> 1]; if (v) v.bump[k & 1] = 1; }
-  shake(i: number): void { const v = this.ropes[i]; if (v) v.shake = 1; }
-  flash(i: number): void { const v = this.ropes[i]; if (v) v.flash = 1; }
-  midOf(i: number): THREE.Vector3 { return this.ropes[i]?.mid.clone() ?? new THREE.Vector3(); }
-  setHighlight(i: number, a: number): void { const v = this.ropes[i]; if (v && !v.flash && !v.glow) { v.mat.emissive.set(0x9cff7a); v.mat.emissiveIntensity = a; } }
-
+  /** A handle bounces (it has just landed, or it can't move). */
+  bumpPin(k: number): void { const v = this.handles[k]; if (v) v.bump = 1; }
+  /** The board shakes (hammer). */
+  shake(t = CFG.shakeDuration): void { this.shakeT = t; }
 
   update(dt: number): void {
     this.clock += dt;
@@ -1005,61 +1002,21 @@ export class Scene3D {
         if (f.t >= 1 && f.level >= 0.999) this.toyPop = 1;
       }
     }
-    // the carried pin: follows the finger, or glides into its hole and the ropes settle
-    const d = this.drag;
-    if (d) {
-      if (d.to) {
-        d.t = Math.min(1, d.t + dt / (d.dur ?? 0.13));
-        const e = d.t * d.t * (3 - 2 * d.t);
-        d.p.lerpVectors(d.from, d.to, e);
-        d.p.y = d.from.y * (1 - e);
-      }
-      // re-lay the carried rope and everything stacked above it (only when the pin has really moved)
-      if (d.p.distanceTo(this.dragAt) > 0.04) {
-        this.dragAt.copy(d.p);
-        this.rebuild(true);
-      } else this.placeExtras();
-      if (d.to && d.t >= 1) {
-        const k = d.k, done = d.done;
-        this.drag = null;
-        this.rebuild();
-        this.bumpPin(k);
-        done?.();
-      }
-    }
-    // empty holes glow softly while a pin is up
-    const lit = this.drag || this.selected >= 0;
-    this.holeMeshes.forEach((m, h) => { (m.material as THREE.MeshStandardMaterial).emissiveIntensity = lit && this.emptyNow.has(h) ? 0.16 + 0.12 * Math.sin(this.clock * 7) : 0; });
-    this.ropes.forEach((v, i) => {
-      for (const e of [0, 1]) {
-        const pin = v.pins[e].group;
-        if (v.bump[e] > 0) v.bump[e] = Math.max(0, v.bump[e] - dt * 3);
-        const sel = this.selected === 2 * i + e;
-        const sq = Math.sin(v.bump[e] * Math.PI * 2) * v.bump[e] * 0.25;
-        pin.scale.set(1 + sq, 1 - sq, 1 + sq);
-        if (sel) pin.position.y = 0.12 + Math.sin(this.clock * 8) * 0.05;
-        else if (!(this.drag && this.drag.k === 2 * i + e)) pin.position.y = 0;
-      }
-      if (v.gone) {
-        // the rope reels in from both ends into a spinning ball at its middle, which lifts off; the pins pop out
+    this.syncAll(dt);
+    // the board shakes under the hammer
+    this.shakeT = Math.max(0, this.shakeT - dt);
+    const k0 = this.shakeT / CFG.shakeDuration;
+    this.board.position.set(Math.sin(this.clock * 70) * 0.06 * k0, 0, Math.cos(this.clock * 53) * 0.12 * k0);
+    this.ropes.forEach((v) => {
+      if (!v) return;
+      if (v.gone && v.ball && v.anim < 1) {
         v.anim = Math.min(1, v.anim + dt / COIL);
         const k = v.anim, e = k * k * (3 - 2 * k);
-        const per = RADIAL * 6, cut = Math.floor((v.segs * Math.min(1, e * 1.08)) / 2);
-        if (v.tube) { v.tube.geometry.setDrawRange(cut * per, Math.max(0, (v.segs - 2 * cut) * per)); v.tube.visible = v.segs - 2 * cut > 0; }
-        if (v.line) { const pl = LINE_RADIAL * 6; v.line.geometry.setDrawRange(cut * pl, Math.max(0, (v.segs - 2 * cut) * pl)); v.line.visible = v.segs - 2 * cut > 0; }
-        for (const c of v.caps) c.visible = k < 0.15;
-        for (const p of v.pins) p.group.scale.setScalar(Math.max(0.001, k < 0.2 ? 1 + k : 1.2 - (k - 0.2) * 1.5));
-        if (v.ball) {
-          v.ball.visible = k < 1;
-          v.ball.scale.setScalar(Math.max(0.001, 0.25 + 0.75 * e));
-          v.ball.position.copy(v.mid).add(new THREE.Vector3(0, 0.2 + e * 0.5, 0));
-          v.ball.rotation.set(k * 9, k * 5, 0);
-        }
-        v.group.visible = k < 1;
-      }
-      if (v.shake > 0) {
-        v.shake = Math.max(0, v.shake - dt * 2.5);
-        v.group.position.x = Math.sin(v.shake * 40) * v.shake * 0.08;
+        v.ball.visible = k < 1;
+        v.ball.scale.setScalar(Math.max(0.001, 0.25 + 0.75 * e));
+        v.ball.position.copy(v.mid).add(new THREE.Vector3(0, 0.2 + e * 0.5, 0));
+        v.ball.rotation.set(k * 9, k * 5, 0);
+        if (k >= 1) v.group.visible = false;
       }
       if (v.flash > 0) {
         v.flash = Math.max(0, v.flash - dt * 1.5);
@@ -1072,40 +1029,6 @@ export class Scene3D {
       } else if (v.mat.emissive.r > 0.9 && v.mat.emissive.g < 0.5) v.mat.emissiveIntensity = 0;
       else if (v.mat.emissive.b > 0.9 && v.mat.emissive.r > 0.9) v.mat.emissiveIntensity = 0;
     });
-
-    const f = this.lockFx;
-    if (f) {
-      if (f.key && !f.open) {
-        f.key.position.x = f.keyHome.x; f.key.position.z = f.keyHome.z;
-        f.key.position.y = f.keyHome.y + Math.sin(this.clock * 3) * 0.04;
-        f.key.rotation.y = Math.sin(this.clock * 1.6) * 0.5;
-      }
-      if (f.shake > 0) {
-        f.shake = Math.max(0, f.shake - dt * 2.5);
-        f.pad.rotation.z = Math.sin(f.shake * 36) * f.shake * 0.35;
-      }
-      if (f.open && f.t < 2) {
-        // key flies in an arc into the lock (0–0.5), the shackle pops (0.5–0.8), the padlock drops away (0.8–1.3)
-        f.t = Math.min(2, f.t + dt);
-        const t = f.t;
-        if (f.key) {
-          const k = Math.min(1, t / 0.5), e = k * k * (3 - 2 * k);
-          f.key.position.lerpVectors(f.keyHome, f.at.clone().add(new THREE.Vector3(0, -0.05, 0.22)), e);
-          f.key.position.y += Math.sin(Math.PI * k) * 0.8;
-          f.key.rotation.set(-0.35, 0, k * Math.PI * 2 + Math.max(0, t - 0.5) * 6);
-          f.key.scale.setScalar(1.7 * (t < 0.8 ? 1 : Math.max(0.001, 1 - (t - 0.8) / 0.3)));
-        }
-        if (t > 0.5) f.shackle.position.y = 0.16 + Math.min(1, (t - 0.5) / 0.15) * 0.12;
-        if (t > 0.5 && f.strands.some((k) => this.ropes[k].dim)) for (const k of f.strands) { this.ropes[k].dim = false; this.tint(k); }
-        if (t > 0.8) {
-          const k = Math.min(1, (t - 0.8) / 0.5);
-          f.pad.position.y = f.at.y - k * k * 0.9;
-          f.pad.scale.setScalar(1.7 * Math.max(0.001, 1 - k));
-          f.pad.rotation.z = k * 0.8;
-        }
-        if (t >= 1.3) { f.t = 2; this.placeLock(); }
-      }
-    }
   }
 
   // ------------------------------------------------------------ view
@@ -1154,9 +1077,9 @@ export class Scene3D {
     this.camera.updateProjectionMatrix();
     // where the board's far (top) frame edge lands on screen at 1× zoom — the basket sits right above it
     {
-      const fo = this.frameOut, y = -0.02;
-      const l = this.toScreen(new THREE.Vector3(-this.zoom.w / 2 - fo, y, -this.zoom.d / 2 - fo));
-      const r = this.toScreen(new THREE.Vector3(this.zoom.w / 2 + fo, y, -this.zoom.d / 2 - fo));
+      const fo = this.frameOut, y = -0.02, cx = this.target.x, cz = this.target.z;
+      const l = this.toScreen(new THREE.Vector3(cx - this.zoom.w / 2 - fo, y, cz - this.zoom.d / 2 - fo));
+      const r = this.toScreen(new THREE.Vector3(cx + this.zoom.w / 2 + fo, y, cz - this.zoom.d / 2 - fo));
       this.boardTop = { x0: l.x, x1: r.x, y: Math.min(l.y, r.y) };
     }
     // the player's zoom + pan on top of the fit
@@ -1200,16 +1123,22 @@ export class Scene3D {
     return { x: this.view.x + ((q.x + 1) / 2) * this.view.w, y: this.view.y + ((1 - q.y) / 2) * this.view.h };
   }
 
-  /** The top-most strand under the page point (css px), or -1. */
-  pick(x: number, y: number): number {
-    const nx = ((x - this.view.x) / this.view.w) * 2 - 1;
-    const ny = -(((y - this.view.y) / this.view.h) * 2 - 1);
-    this.ray.setFromCamera(new THREE.Vector2(nx, ny), this.camera);
-    const hits = this.ray.intersectObjects(this.ropes.filter((s) => !s.gone && s.hit).map((s) => s.hit!), false);
-    if (!hits.length) return -1;
-    // among hits close to the ray, prefer the highest strand
-    const best = hits.slice(0, 4).sort((a, b) => b.point.y - a.point.y)[0];
-    return best.object.userData.strand;
+  /** The rope under the page point (css px) and the bead nearest it, preferring the one on top; null if none. */
+  pick(x: number, y: number): { rope: number; bead: number } | null {
+    const r = this.rules;
+    if (!r) return null;
+    let best: { rope: number; bead: number } | null = null, bd = Infinity;
+    const lim = Math.max(26, this.pinPx() * 1.1), p = new THREE.Vector3();
+    r.ropes.forEach((m, i) => {
+      if (m.gone) return;
+      const wr = r.world.ropes[m.w];
+      for (let q = 0; q < wr.n; q++) {
+        p.set(wr.x[q * 3], wr.x[q * 3 + 1], wr.x[q * 3 + 2]);
+        const s = this.toScreen(p), dd = Math.hypot(s.x - x, s.y - y) - p.y * 20;
+        if (dd < lim && dd < bd) { bd = dd; best = { rope: i, bead: q }; }
+      }
+    });
+    return best;
   }
 
   /** The finished toy, big in the middle of the screen, turning: `k` 0..1 fades the board under a sky veil. */

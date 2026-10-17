@@ -1,15 +1,9 @@
-// Board layouts: the grid of the reference — `grid:CxR`, holes 0.76 of the pitch
-// across (115 px holes, 152 px apart). Positions: x right, y down.
+// Board grid spacing. Rows are CFG.STEP apart (the spec's 92 px). Columns are spread wider
+// so a tall grid still makes a board about as wide as it is tall and fills the width of the
+// screen (asked for in this game; the spec has square spacing).
 
-export type ShapeName = `grid:${number}x${number}`;
+import { CFG } from './config.ts';
 
-export const GRID_PITCH = 1.15;
-
-/** The holes of a `grid:CxR` board. */
-export function layout(shape: ShapeName, _n = 0): [number, number][] {
-  const g = /^grid:(\d+)x(\d+)$/.exec(shape);
-  const cols = g ? +g[1] : 4, rows = g ? +g[2] : 6;
-  const out: [number, number][] = [];
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out.push([(c - (cols - 1) / 2) * GRID_PITCH, (r - (rows - 1) / 2) * GRID_PITCH]);
-  return out;
-}
+/** Column spacing of a cols × rows grid: near-square board, at most 1.4 rows apart. */
+export const pitchX = (cols: number, rows: number): number =>
+  Math.min(CFG.STEP * 1.4, Math.max(CFG.STEP, ((CFG.STEP * (rows - 1)) / Math.max(1, cols - 1)) * 0.92));
