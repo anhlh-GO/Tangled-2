@@ -237,7 +237,7 @@ const at = (b: Board, s: number): P => [b.slots[s].x, b.slots[s].z];
   b2.setFinger([p2[0], p2[2] + 0.7]); b2.press(0); b2.run(3);
   const t = at(b2, S(0, 0));
   for (let q = 1; q <= 20; q++) { b2.setFinger([p2[0] + (t[0] - p2[0]) * q / 20, p2[2] + 0.7 + (t[1] - p2[2]) * q / 20]); b2.run(1); }
-  b2.world.ropes[0].rest = 1.0;                             // the rope is now far longer along its beads than it may be
+  b2.world.ropes[0].rest = b2.world.ropes[0].nominal = 1.0;  // the rope is now far longer along its beads than it may be
   b2.up();
   const ev2: { k: string; why?: string }[] = [];
   for (let q = 0; q < 200 && b2.handles[0].state !== 'stable'; q++) ev2.push(...b2.run(1));

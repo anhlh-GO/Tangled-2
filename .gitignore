@@ -9,3 +9,4 @@ dist
 
 # Capacitor Android project (generated in CI)
 /android
+.gen-levels

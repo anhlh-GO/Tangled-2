@@ -103,7 +103,7 @@ function pinMesh(color: THREE.Color): PinMesh {
   pts.push(new THREE.Vector2(0, PIN_H));
   const body = new THREE.MeshPhysicalMaterial({ color, roughness: 0.32, clearcoat: 0.6, clearcoatRoughness: 0.25 });
   const m = new THREE.Mesh(new THREE.LatheGeometry(pts, 40), body);
-  m.castShadow = true;
+  m.castShadow = false;
   const rim = new THREE.MeshBasicMaterial({ color: 0x16161e, side: THREE.BackSide });
   const out = new THREE.Mesh(m.geometry, rim);
   out.scale.set(1.07, 1.02, 1.07);
@@ -190,14 +190,11 @@ function ropeGeometry(curve: THREE.Curve<THREE.Vector3>, segs: number, r: number
   return geo;
 }
 /** Rich, glossy rope colour (as in the reference): a touch more saturated and deeper than the flat yarn colour. */
-function ropeColor(c: THREE.Color): THREE.Color {
-  const hsl = { h: 0, s: 0, l: 0 };
-  c.getHSL(hsl);
-  return new THREE.Color().setHSL(hsl.h, Math.min(1, hsl.s * 1.12), hsl.l * 0.95);
-}
-/** Glossy smooth rope with faint twist lines (the reference). */
+/** The rope's own colour, as in the reference (bright, not deepened). */
+function ropeColor(c: THREE.Color): THREE.Color { return c.clone(); }
+/** Soft satin rope with faint twist lines (the reference): a little sheen, no plastic gloss. */
 function ropeMaterial(color: THREE.Color): THREE.MeshPhysicalMaterial {
-  return new THREE.MeshPhysicalMaterial({ color: ropeColor(color), vertexColors: true, roughness: 0.22, clearcoat: 1, clearcoatRoughness: 0.12 });
+  return new THREE.MeshPhysicalMaterial({ color: ropeColor(color), vertexColors: true, roughness: 0.42, clearcoat: 0.35, clearcoatRoughness: 0.35 });
 }
 const LINE_MAT = new THREE.MeshBasicMaterial({ color: 0x16161e, side: THREE.BackSide });
 const LINE_RADIAL = 10;
@@ -709,7 +706,7 @@ export class Scene3D {
       const bar = new THREE.Mesh(new THREE.BoxGeometry(d, PIN_H * 0.7, PIN_R * 0.9), new THREE.MeshPhysicalMaterial({ color, roughness: 0.32, clearcoat: 0.6 }));
       bar.position.copy(offs[a]).add(offs[b]).multiplyScalar(0.5).setY(PIN_H * 0.35);
       bar.rotation.y = -Math.atan2(offs[b].z - offs[a].z, offs[b].x - offs[a].x);
-      bar.castShadow = true;
+      bar.castShadow = false;
       pin.group.add(bar);
     }
     // a geared handle: a little golden cog on top
@@ -807,8 +804,8 @@ export class Scene3D {
     const segs = Math.max(12, (wr.n - 1) * 2);
     const buf = new TubeBuf(segs, RADIAL, R, 0.07), lbuf = new TubeBuf(segs, LINE_RADIAL, R * 1.12, 0);
     const tube = new THREE.Mesh(buf.geo, mat), line = new THREE.Mesh(lbuf.geo, LINE_MAT);
-    tube.castShadow = true;
-    tube.receiveShadow = true;
+    tube.castShadow = false;   // no shadows under the ropes (the reference)
+    tube.receiveShadow = false;
     tube.frustumCulled = false;
     line.frustumCulled = false;
     const group = new THREE.Group();

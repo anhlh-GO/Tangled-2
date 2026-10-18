@@ -700,7 +700,7 @@ export class Board {
     return L / m.length;
   }
   /** Length along the beads / physical length. */
-  restLengthRate(i: number): number { const w = this.ropes[i].w; if (w < 0) return 0; const r = this.world.ropes[w]; return r.length() / r.rest; }
+  restLengthRate(i: number): number { const w = this.ropes[i].w; if (w < 0) return 0; const r = this.world.ropes[w]; return r.length() / r.nominal; }
   private snapLimit(i: number, reach: boolean): number {
     const loose = CFG.snapRate + CFG.extraRopeLengthForOperate / this.ropes[i].length;
     return reach && !this.ropes[i].overAtReach ? CFG.snapRate : loose;
@@ -778,6 +778,7 @@ export class Board {
     for (const r of g.ropes) {
       const w = this.world.ropes[this.ropes[r].w], d = this.rd[r];
       const A = this.handlePos(d.a), B = this.handlePos(d.b);
+      w.adapt = false;
       w.rest = Math.max(0.05, Math.min(w.rest, Math.hypot(A[0] - B[0], A[1] - B[1], A[2] - B[2])));
     }
     if (g.t >= up + down + mv) {
@@ -871,7 +872,7 @@ export class Board {
     for (const c of due) {
       const m = this.ropes[c.rope], g = this.groups[m.group];
       const halves = this.world.cut(m.w, c.bead);
-      for (const w of halves) { this.owner[w] = c.rope; this.shrink.push({ w, t: 0, from: this.world.ropes[w].rest }); }
+      for (const w of halves) { this.owner[w] = c.rope; this.world.ropes[w].adapt = false; this.shrink.push({ w, t: 0, from: this.world.ropes[w].rest }); }
       m.gone = true;
       g.cut = false;
       for (const h of this.handles) h.ropes = h.ropes.filter((r) => r !== c.rope);

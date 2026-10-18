@@ -1054,7 +1054,7 @@ function drawDrill(): void {
  * what the player may touch (`allow`: 's<i>' strand, 'b_<key>' booster, 'z' zoom) and what ends it.
  */
 type CoachUntil = 'tap' | 'move' | 'pull' | 'knit' | 'booster' | 'snip' | 'zoom';
-interface CoachStep { text: string; at?: () => { x: number; y: number } | null; to?: () => { x: number; y: number } | null; allow?: (what: string) => boolean; until: CoachUntil; t?: number; r?: number }
+interface CoachStep { text: string; at?: () => { x: number; y: number } | null; to?: () => { x: number; y: number } | null; allow?: (what: string) => boolean; until: CoachUntil; t?: number; r?: number; done?: () => boolean }
 let coach: { steps: CoachStep[]; i: number; t: number } | null = null;
 /** The next good move (careful bot), remembered until the board changes. */
 let hintMemo: { key: string; move: [number, number] } = { key: '', move: [-1, -1] };
@@ -1074,36 +1074,25 @@ const bestOnly = (w: string) => { const [k] = bestMove(); return w === `p${k}`; 
 const ropeAt = (i: number) => (i >= 0 && !S.gone[i] ? scene.toScreen(scene.midOf(i)) : null);
 /** The live rope touching the most other groups (the scissors lesson cuts it). */
 const knottiest = () => S.ropes.reduce((b, _, i) => (S.gone[i] ? b : b < 0 || board.touchCount(i) > board.touchCount(b) ? i : b), -1);
-/** A rope on the board tangled with another group, not the one to move next. */
-const caughtRope = () => { const m = board.handles[bestMove()[0]]?.ropes[0] ?? -1; return S.ropes.findIndex((_, i) => !S.gone[i] && i !== m && board.touchCount(i) > 0); };
-const basketAt = () => ({ x: L.basket.x + L.basket.w / 2, y: L.basket.y + L.basket.w * TRAY_H * 0.5 });
 const boosterPoint = (k: BoosterKey) => { const p = boosterAt(BOOSTERS.indexOf(k)); return { x: p.x, y: p.y }; };
 
 function setupTutorial(): void {
   introQueue = [];
   const steps: CoachStep[] = [];
   if (level === 0 && !save.seen.t1) {
-    // first game: step by step, until the first toy part is knitted
+    // first game: only the hand — a drag for each of the first two crossed pairs, along the level's answer
+    // (each rope is its own group, so a pair comes off as two pulls: go on once both are gone)
+    const off = () => S.gone.filter(Boolean).length;
+    const drag = (text: string, n: number): CoachStep => ({ text, at: bestPin, to: bestHole, allow: bestOnly, until: 'pull', r: L.u * 0.3, done: () => off() >= n });
     steps.push(
-      { text: 'Welcome! Untangle the ropes to knit this cute toy.', at: () => scene.toyCenter(), until: 'tap', t: 5, r: L.u * 0.22 },
-      { text: 'Drag a pin into an empty slot to untangle the ropes!', at: bestPin, to: bestHole, allow: bestOnly, until: 'move', r: L.u * 0.3 },
-      { text: 'Ropes that touch no other rope come off by themselves. Keep going!', at: bestPin, to: bestHole, allow: bestOnly, until: 'pull', r: L.u * 0.3 },
-      { text: 'It rolls into a ball and drops into the tray of its color.', at: basketAt, until: 'tap', t: 4, r: L.u * 0.22 },
-      { text: 'Ropes can\u2019t pass through each other — and a rope pulled too tight snaps its pin back. Find the right order!', at: () => ropeAt(caughtRope()), until: 'tap', t: 6 },
-      { text: 'Fill the tray with three of its color — keep going!', at: bestPin, to: bestHole, allow: bestOnly, until: 'knit', r: L.u * 0.3 },
-      { text: 'Tray full! The three balls knit a part of the toy, and the next tray slides in.', at: () => scene.toyCenter(), until: 'tap', t: 4, r: L.u * 0.22 },
-      { text: 'No open tray for a color? The ball waits in a spare slot. If all four fill up, you lose!', at: () => { const a = spareXY(0), b = spareXY(S.cap - 1); return { x: (a.x + b.x) / 2, y: a.y }; }, until: 'tap', t: 6, r: L.u * 0.26 },
-      { text: 'Knit the whole toy to win. Your progress shows up here.', at: () => ({ x: L.bar.x + L.bar.w / 2, y: L.bar.y + L.bar.h / 2 }), until: 'tap', t: 5 },
-    );
+      drag('Drag the pin into the empty slot to untangle the ropes!', 2),
+      drag('Nice! Untangle the next pair.', 4),
+    );   // the last pair: the player's own
     save.seen.t1 = true;
   }
   if (level === 1 && !save.seen.t2) {
-    // second game: zoom and settings
-    const zp = () => { const b = zoomButtons()[0]; return { x: b.x, y: b.y }; };
-    steps.push(
-      { text: 'Busy board? Tap the magnifier (or pinch) to zoom in. Drag the board to look around.', at: zp, allow: (w) => w === 'z', until: 'zoom', t: 7, r: L.u * 0.08 },
-      { text: 'Sound, music, vibration and restart are under the gear.', at: () => ({ x: L.gear.x, y: L.gear.y }), until: 'tap', t: 4, r: L.u * 0.09 },
-    );
+    // second game: where the settings are
+    steps.push({ text: 'Sound, music, vibration and restart are under the gear.', at: () => ({ x: L.gear.x, y: L.gear.y }), until: 'tap', t: 4, r: L.u * 0.09 });
     save.seen.t2 = true;
   }
   for (const k of BOOSTERS) {
@@ -1169,6 +1158,7 @@ function blockerCoach(b: keyof typeof INTRO): CoachStep[] {
 function runQueue(): void { const f = introQueue.shift(); if (f) f(); }
 function coachEvent(what: CoachUntil): void {
   if (!coach || coach.steps[coach.i].until !== what) return;
+  if (coach.steps[coach.i].done?.() === false) return;
   coach.i++;
   coach.t = 0;
   if (coach.i >= coach.steps.length) { coach = null; runQueue(); }
@@ -1183,7 +1173,6 @@ function onTap(x: number, y: number): void {
   if (popup) { void popupTap(x, y); return; }
   if (banner.t > 0.3) { banner.t = 0.3; return; }
   if (coach && coach.steps[coach.i].until === 'tap') { coachEvent('tap'); return; }
-  if (coach && coach.steps[coach.i].until === 'zoom' && !zoomButtonAt(x, y)) return;
   if (Math.hypot(x - L.gear.x, y - L.gear.y) < L.gear.r * 1.5) { popup = { kind: 'settings', t: 0 }; sfx.tap(); return; }
   const zb = zoomButtonAt(x, y);
   if (zb) {

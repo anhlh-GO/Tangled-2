@@ -28,7 +28,10 @@ const ROPE_FRICTION = 0.04;      // speed lost per substep by a bead pressed aga
 const BEND = 0.55;               // stiffness against sharp bends (a bead and the one after next keep apart)
 const BEND_MIN = 1.78;           // …at least this many links apart (a bend of at most ~54° per bead)
 const BEND_SOFT = 0.07;          // and a gentle pull straight at any bend: slack lies in one smooth curve, not in waves
-export const PILLAR_R = 0.2;            // a pillar: a post the ropes go round
+const SLACK_KEEP = 1.04;        // a rope keeps 4 % over the way it has to go…
+const SLACK_PLUS = 0.12;         // …plus this much (little: ropes run nearly straight, as in the reference)
+const SLACK_TAKE = 4;            // and takes the rest in this fast (per second)
+export const PILLAR_R = 0.2;     // a pillar: a post the ropes go round
 const TOUCH = 2 * R + 0.03;      // layer 1: closer than this is a contact
 const CELL = 0.5;                // collision grid
 
@@ -51,7 +54,11 @@ export class Rope {
   n: number;
   x: Float64Array;   // bead positions (3 per bead)
   p: Float64Array;   // last positions (velocity = x - p)
-  rest: number;      // physical length
+  rest: number;      // the length the beads keep now (≤ nominal: slack is taken in, see `adapt`)
+  /** The rope's real length (what the rules use: reach, stretch). */
+  nominal: number;
+  /** Take in slack (off while it disappears or is cut). */
+  adapt = true;
   /** The handles at its two ends (-1 = a loose end, as after a cut). */
   h: [number, number];
   /** Where on each handle it is tied (offset from the handle's position). */
@@ -62,6 +69,7 @@ export class Rope {
   contacts: { at: number; x: number; y: number; z: number }[] = [];
   constructor(init: RopeInit, handles: Handle[]) {
     this.rest = init.rest;
+    this.nominal = init.rest;
     this.h = [init.a, init.b];
     this.off = [init.oa ?? [0, 0], init.ob ?? [0, 0]];
     this.group = init.group;
@@ -235,7 +243,31 @@ export class RopeWorld {
     this.wake();
   }
 
+  /**
+   * A cheat for the feel (asked for): a rope much longer than the way it has to go doesn't
+   * dangle in loops — it takes in its slack, slowly, down to what it needs (straight between
+   * its ends, or round the ropes it touches) plus a little; pulled out again, it lets the
+   * slack back out at once, up to its real length. The rules still use the real length.
+   */
+  private adaptSlack(dt: number): void {
+    for (const r of this.ropes) {
+      if (r.gone || !r.adapt || r.h[0] < 0 || r.h[1] < 0) continue;
+      const a = r.bead(0), b = r.bead(r.n - 1);
+      let need = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+      if (r.contacts.length) {
+        const pts = r.contacts.slice().sort((p, q) => p.at - q.at);
+        let L = 0, p = a;
+        for (const c of pts) { L += Math.hypot(c.x - p[0], c.y - p[1], c.z - p[2]); p = [c.x, c.y, c.z]; }
+        need = Math.max(need, L + Math.hypot(b[0] - p[0], b[1] - p[1], b[2] - p[2]));
+      }
+      const target = Math.min(r.nominal, Math.max(0.6, need * SLACK_KEEP + SLACK_PLUS));
+      if (target > r.rest) { if (r.rest < r.nominal) { r.rest = target; this.wake(); } }
+      else if (r.rest - target > 0.01) { r.rest += (target - r.rest) * Math.min(1, dt * SLACK_TAKE); this.wake(); }
+    }
+  }
+
   step(dt: number): void {
+    this.adaptSlack(dt);
     if (this.asleep) { for (const h of this.handles) h.prev = [...h.pos]; return; }
     this.steps++;
     const h = Math.min(dt, 1 / 30) / SUB;
@@ -398,7 +430,8 @@ export class RopeWorld {
           const t = this.order[m];
           if (t <= s) continue;
           const rb = sr[t], qb = sb[t];
-          if (ra === rb && Math.abs(qa - qb) < 4) continue;
+          // the same rope against itself: only parts far apart along it (a taken-in rope has its beads close)
+          if (ra === rb && (Math.abs(qa - qb) < 4 || Math.abs(qa - qb) * (A.rest / (A.n - 1)) < 2.8 * R)) continue;
           const B = ropes[rb], xb = B.x, ib = qb * 3;
           if (Math.min(xa[ia], xa[ia + 3]) - M > Math.max(xb[ib], xb[ib + 3]) || Math.min(xb[ib], xb[ib + 3]) - M > Math.max(xa[ia], xa[ia + 3])) continue;
           if (Math.min(xa[ia + 2], xa[ia + 5]) - M > Math.max(xb[ib + 2], xb[ib + 5]) || Math.min(xb[ib + 2], xb[ib + 5]) - M > Math.max(xa[ia + 2], xa[ia + 5])) continue;

@@ -406,7 +406,10 @@ if (merge) {
   if (done) continue;
   const t0 = Date.now();
   let lv: LevelData | null = null, attempt = 0;
-  for (; attempt < (argv.includes("--why") ? 12 : 80) && !lv; attempt++) lv = make(i, attempt);
+  // --from-attempt=N: other seeds (a level that failed its first 80 tries)
+  attempt = Number(argv.find((x) => x.startsWith('--from-attempt='))?.slice(15) ?? 0);
+  const last = attempt + (argv.includes('--why') ? 12 : 80);
+  for (; attempt < last && !lv; attempt++) lv = make(i, attempt);
   if (!lv) { console.log(`L${i + 1}: FAILED`, JSON.stringify(WHY)); continue; }
   out[i] = lv;
   const b = lv.board;

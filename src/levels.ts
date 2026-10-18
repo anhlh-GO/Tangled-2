@@ -16,14 +16,14 @@ export const LEVEL_COUNT = 100;
 export const SPARE = 4;
 
 export const YARN = [
-  { name: 'Pink', color: '#F33180' },
-  { name: 'Blue', color: '#1478F4' },
-  { name: 'Yellow', color: '#FFD51C' },
-  { name: 'Green', color: '#34C759' },
-  { name: 'Purple', color: '#9B5CF6' },
-  { name: 'Orange', color: '#FF8A1F' },
-  { name: 'Red', color: '#E8343B' },
-  { name: 'Teal', color: '#12C2C2' },
+  { name: 'Pink', color: '#F59AD8' },
+  { name: 'Blue', color: '#4AA0F2' },
+  { name: 'Yellow', color: '#F8D23C' },
+  { name: 'Green', color: '#5DCB3C' },
+  { name: 'Purple', color: '#8C5FDD' },
+  { name: 'Orange', color: '#F69A33' },
+  { name: 'Red', color: '#E24B3C' },
+  { name: 'Teal', color: '#3EC7C1' },
 ];
 
 /**
